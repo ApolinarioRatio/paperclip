@@ -428,7 +428,7 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.runtimeConfig).toEqual({});
   }, 20_000);
 
-  it("keeps board agent detail unredacted for low-trust agents", async () => {
+  it("redacts credential-bearing fields from board agent detail", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...baseAgent,
       permissions: {
@@ -437,7 +437,9 @@ describe.sequential("agent permission routes", () => {
       },
       adapterConfig: {
         command: "pnpm agent:run",
-        env: { PAPERCLIP_API_KEY: "secret-test-key" },
+        headers: { "x-openclaw-token": "secret-header-token" },
+        devicePrivateKeyPem: "secret-device-private-key",
+        safeOption: "visible",
       },
       runtimeConfig: {
         modelProfiles: {
@@ -459,14 +461,124 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(200);
     expect(res.body.adapterConfig).toMatchObject({
       command: "pnpm agent:run",
-      env: { PAPERCLIP_API_KEY: "secret-test-key" },
+      headers: { "x-openclaw-token": "***REDACTED***" },
+      devicePrivateKeyPem: "***REDACTED***",
+      safeOption: "visible",
     });
+    expect(JSON.stringify(res.body)).not.toContain("secret-header-token");
+    expect(JSON.stringify(res.body)).not.toContain("secret-device-private-key");
     expect(res.body.runtimeConfig).toMatchObject({
       modelProfiles: {
         default: { enabled: true, adapterConfig: { model: "openai/gpt-5.4-mini" } },
       },
     });
     expect(res.body.permissions).toMatchObject({ trustPreset: LOW_TRUST_REVIEW_PRESET });
+  }, 20_000);
+
+  it("redacts credential-bearing fields from privileged company agent lists", async () => {
+    mockAgentService.list.mockResolvedValue([{
+      ...baseAgent,
+      adapterConfig: {
+        headers: { authorization: "Bearer secret-list-token" },
+        devicePrivateKeyPem: "secret-list-private-key",
+        safeOption: "visible",
+      },
+    }]);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+    expect(res.status).toBe(200);
+    expect(res.body[0].adapterConfig).toMatchObject({
+      headers: { authorization: "***REDACTED***" },
+      devicePrivateKeyPem: "***REDACTED***",
+      safeOption: "visible",
+    });
+    expect(JSON.stringify(res.body)).not.toContain("secret-list-token");
+    expect(JSON.stringify(res.body)).not.toContain("secret-list-private-key");
+  }, 20_000);
+
+  it("redacts credential-bearing fields from agent self detail", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        headers: { "x-openclaw-token": "secret-self-token" },
+        devicePrivateKeyPem: "secret-self-private-key",
+        safeOption: "visible",
+      },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "api_key",
+      keyScope: null,
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/agents/me"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig).toMatchObject({
+      headers: { "x-openclaw-token": "***REDACTED***" },
+      devicePrivateKeyPem: "***REDACTED***",
+      safeOption: "visible",
+    });
+    expect(JSON.stringify(res.body)).not.toContain("secret-self-token");
+    expect(JSON.stringify(res.body)).not.toContain("secret-self-private-key");
+  }, 20_000);
+
+  it("preserves nested credentials when a redacted detail config is submitted unchanged", async () => {
+    const storedAgent = {
+      ...baseAgent,
+      adapterConfig: {
+        headers: { "x-openclaw-token": "stored-header-token" },
+        devicePrivateKeyPem: "stored-device-private-key",
+        env: {
+          LEGACY_VALUE: "stored-legacy-env",
+          TYPED_VALUE: { type: "plain", value: "stored-typed-env" },
+        },
+        safeOption: "before",
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(storedAgent);
+    mockAgentService.update.mockResolvedValue({
+      ...storedAgent,
+      adapterConfig: { ...storedAgent.adapterConfig, safeOption: "after" },
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+    const detail = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        replaceAdapterConfig: true,
+        adapterConfig: { ...detail.body.adapterConfig, safeOption: "after" },
+      }));
+
+    expect(res.status).toBe(200);
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith(
+      companyId,
+      {
+        ...storedAgent.adapterConfig,
+        safeOption: "after",
+      },
+      expect.any(Object),
+    );
   }, 20_000);
 
   it("redacts company agent list for authenticated company members without agent admin permission", async () => {
