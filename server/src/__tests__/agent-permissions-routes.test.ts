@@ -535,7 +535,7 @@ describe.sequential("agent permission routes", () => {
     expect(JSON.stringify(res.body)).not.toContain("secret-self-private-key");
   }, 20_000);
 
-  it("preserves nested credentials when a redacted detail config is submitted unchanged", async () => {
+  it("preserves nested credentials on PATCH while redacting them from the response", async () => {
     const storedAgent = {
       ...baseAgent,
       adapterConfig: {
@@ -579,6 +579,19 @@ describe.sequential("agent permission routes", () => {
       },
       expect.any(Object),
     );
+    expect(res.body.adapterConfig).toMatchObject({
+      headers: { "x-openclaw-token": "***REDACTED***" },
+      devicePrivateKeyPem: "***REDACTED***",
+      env: {
+        LEGACY_VALUE: { type: "plain", value: "***REDACTED***" },
+        TYPED_VALUE: { type: "plain", value: "***REDACTED***" },
+      },
+      safeOption: "after",
+    });
+    expect(JSON.stringify(res.body)).not.toContain("stored-header-token");
+    expect(JSON.stringify(res.body)).not.toContain("stored-device-private-key");
+    expect(JSON.stringify(res.body)).not.toContain("stored-legacy-env");
+    expect(JSON.stringify(res.body)).not.toContain("stored-typed-env");
   }, 20_000);
 
   it("redacts company agent list for authenticated company members without agent admin permission", async () => {
