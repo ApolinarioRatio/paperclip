@@ -78,7 +78,11 @@ import {
   refreshAdapterModels,
   requireServerAdapter,
 } from "../adapters/index.js";
-import { redactEventPayload } from "../redaction.js";
+import {
+  redactAgentAdapterConfig,
+  redactEventPayload,
+  restoreRedactedConfigValue,
+} from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -574,7 +578,7 @@ export function agentRoutes(
     ]);
 
     return {
-      ...(options?.restricted ? redactForRestrictedAgentView(agent) : agent),
+      ...(options?.restricted ? redactForRestrictedAgentView(agent) : redactAgentSecrets(agent)),
       chainOfCommand,
       access: accessState,
     };
@@ -1493,6 +1497,14 @@ export function agentRoutes(
     };
   }
 
+  function redactAgentSecrets(agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) {
+    return {
+      ...agent,
+      adapterConfig: redactAgentAdapterConfig(agent.adapterConfig),
+      runtimeConfig: redactEventPayload(agent.runtimeConfig),
+    };
+  }
+
   function redactAgentConfiguration(agent: Awaited<ReturnType<typeof svc.getById>>) {
     if (!agent) return null;
     return {
@@ -1826,7 +1838,7 @@ export function agentRoutes(
     const result = await filterAgentsForActor(req, await svc.list(companyId));
     const canReadConfigs = await actorCanReadConfigurationsForCompany(req, companyId);
     if (canReadConfigs) {
-      res.json(result);
+      res.json(result.map((agent) => redactAgentSecrets(agent)));
       return;
     }
     res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
@@ -2823,12 +2835,16 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
-      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
+      const restoredAdapterConfig = restoreRedactedConfigValue(
+        adapterConfig,
+        existing.adapterConfig,
+      ) as Record<string, unknown>;
+      assertNoAgentAdapterConfigMutation(req, restoredAdapterConfig);
+      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(restoredAdapterConfig);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
       }
-      patchData.adapterConfig = adapterConfig;
+      patchData.adapterConfig = restoredAdapterConfig;
     }
 
     const requestedAdapterType = hasOwn(patchData, "adapterType")
@@ -2841,8 +2857,12 @@ export function agentRoutes(
         res.status(422).json({ error: "runtimeConfig must be an object" });
         return;
       }
-      assertNoAgentRuntimeConfigAdapterConfigMutation(req, runtimeConfig);
-      requestedRuntimeConfig = runtimeConfig;
+      const restoredRuntimeConfig = restoreRedactedConfigValue(
+        runtimeConfig,
+        existing.runtimeConfig,
+      ) as Record<string, unknown>;
+      assertNoAgentRuntimeConfigAdapterConfigMutation(req, restoredRuntimeConfig);
+      requestedRuntimeConfig = restoredRuntimeConfig;
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
