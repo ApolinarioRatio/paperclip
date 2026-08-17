@@ -1720,10 +1720,11 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   ) {
     return false;
   }
-  // Only human comments should implicitly reopen finished work.
-  // Agent-authored comments remain communicative unless reopen was explicit.
+  // Terminal work requires explicit reopen/resume intent. A plain comment is
+  // communicative only and must not move a completed card backward.
+  if (isClosedIssueStatus(input.issueStatus)) return false;
   if (input.actorType !== "user") return false;
-  if (!isClosedIssueStatus(input.issueStatus) && input.issueStatus !== "blocked") return false;
+  if (input.issueStatus !== "blocked") return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
   return true;
 }
@@ -6951,15 +6952,21 @@ export function issueRoutes(
       comment: commentBody,
       reviewRequest,
       reopen: reopenRequested,
+      reopenReason: reopenReasonInput,
       resume: resumeRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
       ...updateFields
     } = req.body;
+    const reopenReason = reopenReasonInput?.trim() || commentBody?.trim() || null;
     const shouldCancelActiveRunForCancelledStatus =
       existing.status !== "cancelled" && updateFields.status === "cancelled";
     if (resumeRequested === true && !commentBody) {
       res.status(400).json({ error: "Follow-up intent requires a comment" });
+      return;
+    }
+    if ((reopenRequested === true || resumeRequested === true) && isClosed && !reopenReason) {
+      res.status(400).json({ error: "Reopening a terminal issue requires a reason" });
       return;
     }
     if (
@@ -7269,6 +7276,9 @@ export function issueRoutes(
           ...updateFields,
           actorAgentId: actor.agentId ?? null,
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          ...(isClosed && updateFields.status === "todo"
+            ? { expectedStatus: existing.status, expectedUpdatedAt: existing.updatedAt }
+            : {}),
         });
       }
     } catch (err) {
@@ -7295,6 +7305,11 @@ export function issueRoutes(
       throw err;
     }
     if (!issue) {
+      const current = await svc.getById(id);
+      if (current && isClosed && updateFields.status === "todo") {
+        res.status(409).json({ error: "Issue changed before reopen could be applied" });
+        return;
+      }
       res.status(404).json({ error: "Issue not found" });
       return;
     }
@@ -7444,6 +7459,7 @@ export function issueRoutes(
         ...(commentBody ? { source: "comment" } : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
+        ...(reopened ? { reopenReason } : {}),
         ...(scheduledRetrySupersededByComment
           ? {
               scheduledRetrySupersededByComment: true,
@@ -8878,6 +8894,7 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     const reopenRequested = req.body.reopen === true;
+    const reopenReason = req.body.reopenReason?.trim() || req.body.body.trim();
     const resumeRequested = req.body.resume === true;
     const interruptRequested = req.body.interrupt === true;
     const isClosed = isClosedIssueStatus(issue.status);
@@ -8969,8 +8986,18 @@ export function issueRoutes(
             actor,
           })
         : null;
-      const reopenedIssue = await svc.update(id, { status: "todo" });
+      const reopenedIssue = await svc.update(id, {
+        status: "todo",
+        ...(isClosed
+          ? { expectedStatus: issue.status, expectedUpdatedAt: issue.updatedAt }
+          : {}),
+      });
       if (!reopenedIssue) {
+        const latest = await svc.getById(id);
+        if (latest && isClosed) {
+          res.status(409).json({ error: "Issue changed before reopen could be applied" });
+          return;
+        }
         res.status(404).json({ error: "Issue not found" });
         return;
       }
@@ -8990,6 +9017,7 @@ export function issueRoutes(
         details: {
           status: "todo",
           ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
+          ...(reopened ? { reopenReason } : {}),
           ...(scheduledRetrySupersededByComment
             ? {
                 scheduledRetrySupersededByComment: true,
@@ -9206,6 +9234,7 @@ export function issueRoutes(
         issueTitle: currentIssue.title,
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
+        ...(reopened ? { reopenReason } : {}),
         ...(scheduledRetrySupersededByComment
           ? {
               scheduledRetrySupersededByComment: true,

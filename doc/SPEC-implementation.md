@@ -479,6 +479,8 @@ Allowed transitions:
 - `in_review -> in_progress | done | cancelled`
 - `blocked -> todo | in_progress | cancelled`
 - terminal: `done`, `cancelled`
+- plain comments and queued/deferred wake delivery do not reopen terminal issues
+- reopening requires explicit `reopen`/`resume` intent with an audited reason, and the status write compares the terminal status/version read by the caller before scheduling a new wake
 
 Side effects:
 

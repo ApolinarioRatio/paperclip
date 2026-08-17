@@ -459,6 +459,7 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
   reviewRequest: issueReviewRequestSchema.optional().nullable(),
   reopen: z.boolean().optional(),
+  reopenReason: z.string().trim().min(1).max(2000).optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
@@ -565,6 +566,7 @@ export const addIssueCommentSchema = z.object({
   presentation: issueCommentPresentationSchema.nullable().optional(),
   metadata: issueCommentMetadataSchema.nullable().optional(),
   reopen: z.boolean().optional(),
+  reopenReason: z.string().trim().min(1).max(2000).optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
 });

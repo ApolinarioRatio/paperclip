@@ -4866,6 +4866,52 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
   });
 
+  it("rejects a stale terminal reopen when the issue version changed after read", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const readVersion = new Date("2026-08-17T04:00:00.000Z");
+    const newerVersion = new Date("2026-08-17T04:00:01.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal version watermark",
+      status: "done",
+      priority: "high",
+      completedAt: readVersion,
+      updatedAt: readVersion,
+    });
+
+    await db
+      .update(issues)
+      .set({ title: "Terminal version watermark changed", updatedAt: newerVersion })
+      .where(eq(issues.id, issueId));
+
+    const reopened = await svc.update(issueId, {
+      status: "todo",
+      expectedStatus: "done",
+      expectedUpdatedAt: readVersion,
+    });
+
+    expect(reopened).toBeNull();
+    const row = await db
+      .select({ status: issues.status, title: issues.title, updatedAt: issues.updatedAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toMatchObject({
+      status: "done",
+      title: "Terminal version watermark changed",
+      updatedAt: newerVersion,
+    });
+  });
+
   it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
     // Regression for PR #2482 checkout-adoption review finding: any adoption
     // helper that re-locks an existing in_progress issue (e.g. when the prior
