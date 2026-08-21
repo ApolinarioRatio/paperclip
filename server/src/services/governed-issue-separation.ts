@@ -103,6 +103,24 @@ export async function lockGovernedIssueDecisionLane(
   return locked;
 }
 
+export async function isGovernedIssueControlled(
+  dbOrTx: Db,
+  companyId: string,
+  issueId: string,
+) {
+  const row = await dbOrTx
+    .select({ id: governedIssueBuilderHistory.id })
+    .from(governedIssueBuilderHistory)
+    .where(and(
+      eq(governedIssueBuilderHistory.companyId, companyId),
+      eq(governedIssueBuilderHistory.issueId, issueId),
+      sql`${governedIssueBuilderHistory.approvalId} is not null`,
+    ))
+    .limit(1)
+    .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+  return row !== null;
+}
+
 export async function resolveGovernedVerifierPool(
   dbOrTx: Db,
   input: {
