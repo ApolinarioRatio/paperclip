@@ -435,7 +435,7 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.runtimeConfig).toEqual({});
   }, 20_000);
 
-  it("keeps board agent detail unredacted for low-trust agents", async () => {
+  it("redacts credential-bearing agent configuration from board detail and list responses", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...baseAgent,
       permissions: {
@@ -444,7 +444,12 @@ describe.sequential("agent permission routes", () => {
       },
       adapterConfig: {
         command: "pnpm agent:run",
-        env: { PAPERCLIP_API_KEY: "secret-test-key" },
+        headers: { "x-openclaw-token": "header-test-token" },
+        devicePrivateKeyPem: "device-private-key",
+        env: {
+          PAPERCLIP_API_KEY: "secret-test-key",
+          SAFE_OPTION: "preserved",
+        },
       },
       runtimeConfig: {
         modelProfiles: {
@@ -461,19 +466,29 @@ describe.sequential("agent permission routes", () => {
       companyIds: [companyId],
     });
 
-    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+    const detail = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+    const list = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
 
-    expect(res.status).toBe(200);
-    expect(res.body.adapterConfig).toMatchObject({
+    expect(detail.status).toBe(200);
+    expect(detail.body.adapterConfig).toMatchObject({
       command: "pnpm agent:run",
-      env: { PAPERCLIP_API_KEY: "secret-test-key" },
+      headers: { "x-openclaw-token": "***REDACTED***" },
+      devicePrivateKeyPem: "***REDACTED***",
+      env: { PAPERCLIP_API_KEY: "***REDACTED***", SAFE_OPTION: "preserved" },
     });
-    expect(res.body.runtimeConfig).toMatchObject({
+    expect(JSON.stringify(detail.body)).not.toContain("header-test-token");
+    expect(JSON.stringify(detail.body)).not.toContain("device-private-key");
+    expect(JSON.stringify(detail.body)).not.toContain("secret-test-key");
+    expect(detail.body.runtimeConfig).toMatchObject({
       modelProfiles: {
         default: { enabled: true, adapterConfig: { model: "openai/gpt-5.4-mini" } },
       },
     });
-    expect(res.body.permissions).toMatchObject({ trustPreset: LOW_TRUST_REVIEW_PRESET });
+    expect(detail.body.permissions).toMatchObject({ trustPreset: LOW_TRUST_REVIEW_PRESET });
+    expect(list.status).toBe(200);
+    expect(JSON.stringify(list.body)).not.toContain("header-test-token");
+    expect(JSON.stringify(list.body)).not.toContain("device-private-key");
+    expect(JSON.stringify(list.body)).not.toContain("secret-test-key");
   }, 20_000);
 
   it("redacts company agent list for authenticated company members without agent admin permission", async () => {
