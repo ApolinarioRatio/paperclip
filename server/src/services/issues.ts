@@ -98,6 +98,7 @@ import { assertAssignableAgent } from "./agent-assignability.js";
 import { assertGovernedAssignmentCapacity } from "./governed-queue-assignment.js";
 import {
   authorizeGovernedIssueMutation,
+  isGovernedIssueControlled,
   lockGovernedIssueLane,
 } from "./governed-issue-separation.js";
 import { insertRowsInChunks } from "./batch-insert.js";
@@ -7690,19 +7691,25 @@ export function issueService(db: Db) {
           .where(and(eq(issues.id, id), eq(issues.companyId, existing.companyId)))
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+        const governedControlActive = currentUnderLock
+          ? await isGovernedIssueControlled(tx as unknown as Db, existing.companyId, id)
+          : false;
         if (
-          !currentUnderLock
-          || currentUnderLock.updatedAt.getTime() !== existing.updatedAt.getTime()
-          || currentUnderLock.status !== existing.status
-          || currentUnderLock.assigneeAgentId !== existing.assigneeAgentId
-          || currentUnderLock.assigneeUserId !== existing.assigneeUserId
-          || JSON.stringify(currentUnderLock.executionPolicy) !== JSON.stringify(existing.executionPolicy)
-          || JSON.stringify(currentUnderLock.executionState) !== JSON.stringify(existing.executionState)
+          governedControlActive
+          && (
+            currentUnderLock!.updatedAt.getTime() !== existing.updatedAt.getTime()
+            || currentUnderLock!.status !== existing.status
+            || currentUnderLock!.assigneeAgentId !== existing.assigneeAgentId
+            || currentUnderLock!.assigneeUserId !== existing.assigneeUserId
+            || JSON.stringify(currentUnderLock!.executionPolicy) !== JSON.stringify(existing.executionPolicy)
+            || JSON.stringify(currentUnderLock!.executionState) !== JSON.stringify(existing.executionState)
+          )
         ) {
           throw conflict("Issue changed while its governed mutation was being prepared", {
             code: "governed_issue_compare_and_swap_failed",
           });
         }
+        if (!currentUnderLock) return null;
         const nextStatus = patch.status ?? existing.status;
         const guardedAssignmentAgentId =
           nextAssigneeAgentId

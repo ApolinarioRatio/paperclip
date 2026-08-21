@@ -89,6 +89,7 @@ const mockExternalObjectService = vi.hoisted(() => ({
 const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn());
 const mockCrossIssueInfluenceLimitError = vi.hoisted(() => vi.fn());
 const mockCrossIssueInfluenceRunContextError = vi.hoisted(() => vi.fn());
+const mockLockGovernedIssueDecisionLane = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("@paperclipai/shared/telemetry", () => ({
   trackAgentTaskCompleted: vi.fn(),
@@ -117,6 +118,11 @@ vi.mock("../services/feedback.js", () => ({
 
 vi.mock("../services/heartbeat.js", () => ({
   heartbeatService: () => mockHeartbeatService,
+}));
+
+vi.mock("../services/governed-issue-separation.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/governed-issue-separation.js")>(),
+  lockGovernedIssueDecisionLane: mockLockGovernedIssueDecisionLane,
 }));
 
 vi.mock("../services/instance-settings.js", () => ({
