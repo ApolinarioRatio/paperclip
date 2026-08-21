@@ -79,6 +79,16 @@ describe("GET /health", () => {
     expect(res.body).toEqual({ status: "ok", version: serverVersion, serverVersion: serverVersion, commit: testServerInfo.git.fullSha, serverInfo: testServerInfo });
   }, 15_000);
 
+  it("exposes an immutable runtime build identity for deployment verification", async () => {
+    const app = createApp();
+    const res = await request(app).get("/health/runtime-build");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      runtimeBuildId: "rata2110-governed-queue-v2",
+      baseCommit: "213dabab4f8e1f3bb1803a2924c0fea1289fcd4c",
+    });
+  });
+
   it("keeps the self-hosted health response byte-identical and omits cloud", async () => {
     const app = createApp(undefined, testServerInfo, undefined, {});
 

@@ -1,8 +1,9 @@
-import { index, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
+import { governedIssueBuilderHistory } from "./governed_issue_builder_history.js";
 
 export const issueExecutionDecisions = pgTable(
   "issue_execution_decisions",
@@ -17,11 +18,13 @@ export const issueExecutionDecisions = pgTable(
     outcome: text("outcome").notNull(),
     body: text("body").notNull(),
     createdByRunId: uuid("created_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
+    reservationId: uuid("reservation_id").references(() => governedIssueBuilderHistory.id),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     companyIssueIdx: index("issue_execution_decisions_company_issue_idx").on(table.companyId, table.issueId),
     stageIdx: index("issue_execution_decisions_stage_idx").on(table.issueId, table.stageId, table.createdAt),
+    reservationUq: uniqueIndex("issue_execution_decisions_reservation_uq").on(table.reservationId),
   }),
 );

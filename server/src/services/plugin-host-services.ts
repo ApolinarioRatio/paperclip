@@ -3093,10 +3093,7 @@ export function buildHostServices(
             : {};
           if (policy) executionPolicy.authorizationPolicy = policy;
           else delete executionPolicy.authorizationPolicy;
-          await db
-            .update(issuesTable)
-            .set({ executionPolicy, updatedAt: new Date() })
-            .where(eq(issuesTable.id, issue.id));
+          await issues.update(issue.id, { executionPolicy });
         } else {
           const company = await companies.getById(params.resourceId);
           if (!company || company.id !== companyId) throw new Error("Company not found");

@@ -1,7 +1,8 @@
-import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
+  governedIssueBuilderHistory,
   heartbeatRuns,
   issueComments,
   issueTreeHoldMembers,
@@ -22,6 +23,7 @@ import {
   type IssueTreePreviewWarning,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { assertGovernedAssignmentCapacity } from "./governed-queue-assignment.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 
 type IssueRow = typeof issues.$inferSelect;
@@ -410,6 +412,32 @@ function restoreStatusFromCancelSnapshot(status: IssueStatus): IssueStatus | nul
 }
 
 export function issueTreeControlService(db: Db) {
+  async function assertNoGovernedStatusMutation(
+    dbOrTx: Db,
+    companyId: string,
+    issueIds: string[],
+    operation: "cancel" | "restore",
+  ) {
+    if (issueIds.length === 0) return;
+    const controlled = await dbOrTx
+      .select({ issueId: governedIssueBuilderHistory.issueId })
+      .from(governedIssueBuilderHistory)
+      .where(and(
+        eq(governedIssueBuilderHistory.companyId, companyId),
+        inArray(governedIssueBuilderHistory.issueId, issueIds),
+        isNotNull(governedIssueBuilderHistory.approvalId),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (controlled) {
+      throw conflict(`Issue-tree ${operation} cannot mutate governed work without an explicit exception lane`, {
+        code: "governed_issue_tree_mutation_unsupported",
+        issueId: controlled.issueId,
+        operation,
+      });
+    }
+  }
+
   async function listTreeIssues(companyId: string, rootIssueId: string): Promise<TreeIssue[]> {
     const root = await db
       .select()
@@ -871,6 +899,24 @@ export function issueTreeControlService(db: Db) {
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
+      const lockedRows = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          inArray(issues.id, issueIds),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ))
+        .orderBy(issues.id)
+        .for("update");
+      const lockedIssueIds = lockedRows.map((row) => row.id);
+      await assertNoGovernedStatusMutation(
+        tx as unknown as Db,
+        companyId,
+        lockedIssueIds,
+        "cancel",
+      );
+      if (lockedIssueIds.length === 0) return [];
       const rows = await tx
         .update(issues)
         .set({
@@ -886,7 +932,7 @@ export function issueTreeControlService(db: Db) {
         .where(
           and(
             eq(issues.companyId, companyId),
-            inArray(issues.id, issueIds),
+            inArray(issues.id, lockedIssueIds),
             notInArray(issues.status, ["done", "cancelled"]),
           ),
         )
@@ -972,6 +1018,48 @@ export function issueTreeControlService(db: Db) {
     const releasedCancelHoldIds = activeCancelHolds.map((hold) => hold.id);
     const updatedIssues = await db.transaction(async (tx) => {
       const restored: TreeStatusUpdateResult["updatedIssues"] = [];
+      const candidateRows = restoreIssueIds.length > 0
+        ? await tx
+            .select({
+              id: issues.id,
+              status: issues.status,
+              assigneeAgentId: issues.assigneeAgentId,
+            })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              inArray(issues.id, restoreIssueIds),
+              eq(issues.status, "cancelled"),
+            ))
+            .orderBy(issues.id)
+            .for("update")
+        : [];
+      await assertNoGovernedStatusMutation(
+        tx as unknown as Db,
+        companyId,
+        candidateRows.map((row) => row.id),
+        "restore",
+      );
+      const incomingActiveAssignments = new Map<string, number>();
+      for (const row of candidateRows) {
+        const restoreStatus = restoreStatusByIssueId.get(row.id);
+        if (
+          row.assigneeAgentId
+          && (restoreStatus === "todo" || restoreStatus === "in_progress")
+        ) {
+          incomingActiveAssignments.set(
+            row.assigneeAgentId,
+            (incomingActiveAssignments.get(row.assigneeAgentId) ?? 0) + 1,
+          );
+        }
+      }
+      for (const agentId of [...incomingActiveAssignments.keys()].sort()) {
+        await assertGovernedAssignmentCapacity(tx as unknown as Db, {
+          companyId,
+          agentId,
+          incomingAssignmentCount: incomingActiveAssignments.get(agentId)!,
+        });
+      }
       for (const [status, issueIdsForStatus] of issueIdsByStatus) {
         if (issueIdsForStatus.length === 0) continue;
         const rows = await tx

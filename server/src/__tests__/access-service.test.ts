@@ -181,6 +181,71 @@ describeEmbeddedPostgres("access service", () => {
     expect(historicalIssue.assigneeUserId).toBe(member.principalId);
   });
 
+  it("rejects bulk reassignment of multiple open issues to a governed single-assignment agent", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const member = await db
+      .insert(companyMemberships)
+      .values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: `member-${randomUUID()}`,
+        status: "active",
+        membershipRole: "operator",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const target = await db
+      .insert(agents)
+      .values({
+        companyId: company.id,
+        name: "Governed reassignment target",
+        role: "engineer",
+        status: "idle",
+        adapterType: "hermes_local",
+        adapterConfig: { wakeOnDemand: true },
+        runtimeConfig: { governedQueue: { singleActiveAssignment: true } },
+        permissions: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    await db.insert(issues).values([
+      {
+        companyId: company.id,
+        title: "First open issue",
+        status: "todo",
+        assigneeUserId: member.principalId,
+      },
+      {
+        companyId: company.id,
+        title: "Second open issue",
+        status: "in_progress",
+        assigneeUserId: member.principalId,
+      },
+    ]);
+
+    await expect(
+      accessService(db).archiveMember(company.id, member.id, {
+        reassignment: { assigneeAgentId: target.id },
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "target_has_execution_load", incomingIssueCount: 2 },
+    });
+
+    const persistedMember = await db
+      .select()
+      .from(companyMemberships)
+      .where(eq(companyMemberships.id, member.id))
+      .then((rows) => rows[0]!);
+    expect(persistedMember.status).toBe("active");
+    const persistedIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, company.id), eq(issues.assigneeUserId, member.principalId)));
+    expect(persistedIssues).toHaveLength(2);
+    expect(persistedIssues.every((issue) => issue.assigneeAgentId === null)).toBe(true);
+  });
+
   it("rejects instance-level company access removal for self and protected users", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const access = accessService(db);

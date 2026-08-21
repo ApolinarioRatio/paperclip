@@ -14,6 +14,7 @@ import {
   documentRevisions,
   documents,
   goals,
+  governedIssueBuilderHistory,
   heartbeatRuns,
   routineRuns,
   executionWorkspaces,
@@ -94,6 +95,11 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { assertGovernedAssignmentCapacity } from "./governed-queue-assignment.js";
+import {
+  authorizeGovernedIssueMutation,
+  lockGovernedIssueLane,
+} from "./governed-issue-separation.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import type {
   ImportIssueRow,
@@ -5054,6 +5060,13 @@ export function issueService(db: Db) {
     expectedCheckoutRunId: string;
   }) {
     return db.transaction(async (tx) => {
+      const issueIdentity = await tx
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issueIdentity) return { adopted: null, latest: null };
+      await lockGovernedIssueLane(tx as unknown as Db, issueIdentity.companyId, input.issueId);
       const lockedIssue = await tx
         .select({
           id: issues.id,
@@ -5154,6 +5167,32 @@ export function issueService(db: Db) {
     actorRunId: string;
   }) {
     return db.transaction(async (tx) => {
+      const issueIdentity = await tx
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issueIdentity) return null;
+      await lockGovernedIssueLane(tx as unknown as Db, issueIdentity.companyId, input.issueId);
+      const lockedIssue = await tx
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        !lockedIssue
+        || lockedIssue.status !== "in_progress"
+        || lockedIssue.assigneeAgentId !== input.actorAgentId
+        || lockedIssue.checkoutRunId !== null
+        || (lockedIssue.executionRunId !== null && lockedIssue.executionRunId !== input.actorRunId)
+      ) return null;
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
@@ -5197,13 +5236,18 @@ export function issueService(db: Db) {
 
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
-      );
+      const identity = await tx
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!identity) return false;
+      await lockGovernedIssueLane(tx as unknown as Db, identity.companyId, issueId);
       const issue = await tx
         .select({ executionRunId: issues.executionRunId })
         .from(issues)
         .where(eq(issues.id, issueId))
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!issue?.executionRunId) return false;
 
@@ -5245,13 +5289,18 @@ export function issueService(db: Db) {
   // assigned or what status the issue is currently in.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
-      );
+      const identity = await tx
+        .select({ companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!identity) return false;
+      await lockGovernedIssueLane(tx as unknown as Db, identity.companyId, issueId);
       const issue = await tx
         .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
         .from(issues)
         .where(eq(issues.id, issueId))
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!issue?.checkoutRunId) return false;
 
@@ -6974,6 +7023,16 @@ export function issueService(db: Db) {
           return withRelations;
         }
 
+        if (
+          issueData.assigneeAgentId
+          && (issueData.status === "todo" || issueData.status === "in_progress")
+        ) {
+          await assertGovernedAssignmentCapacity(tx as unknown as Db, {
+            companyId,
+            agentId: issueData.assigneeAgentId,
+          });
+        }
+
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
         let executionWorkspaceId = issueData.executionWorkspaceId ?? null;
@@ -7282,6 +7341,7 @@ export function issueService(db: Db) {
         };
 
         const validatedAgentIds = new Set<string>();
+        const incomingActiveAssignments = new Map<string, number>();
         const validatedWorkspaceKeys = new Set<string>();
         const issueRows: Array<Record<string, unknown>> = [];
         const labelRows: Array<{ issueId: string; labelId: string; companyId: string }> = [];
@@ -7300,6 +7360,15 @@ export function issueService(db: Db) {
           }
           if (row.status === "in_progress" && !row.assigneeAgentId) {
             throw unprocessable("in_progress issues require an assignee");
+          }
+          if (
+            row.assigneeAgentId
+            && (row.status === "todo" || row.status === "in_progress")
+          ) {
+            incomingActiveAssignments.set(
+              row.assigneeAgentId,
+              (incomingActiveAssignments.get(row.assigneeAgentId) ?? 0) + 1,
+            );
           }
 
           const projectId = row.projectId ?? null;
@@ -7363,6 +7432,13 @@ export function issueService(db: Db) {
           }
         }
 
+        for (const agentId of [...incomingActiveAssignments.keys()].sort()) {
+          await assertGovernedAssignmentCapacity(tx as unknown as Db, {
+            companyId,
+            agentId,
+            incomingAssignmentCount: incomingActiveAssignments.get(agentId)!,
+          });
+        }
         await insertRowsInChunks(tx, issues, issueRows);
         await insertRowsInChunks(tx, issueLabels, labelRows);
       });
@@ -7607,6 +7683,46 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        await lockGovernedIssueLane(tx as unknown as Db, existing.companyId, id);
+        const currentUnderLock = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.id, id), eq(issues.companyId, existing.companyId)))
+          .for("update")
+          .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+        if (
+          !currentUnderLock
+          || currentUnderLock.updatedAt.getTime() !== existing.updatedAt.getTime()
+          || currentUnderLock.status !== existing.status
+          || currentUnderLock.assigneeAgentId !== existing.assigneeAgentId
+          || currentUnderLock.assigneeUserId !== existing.assigneeUserId
+          || JSON.stringify(currentUnderLock.executionPolicy) !== JSON.stringify(existing.executionPolicy)
+          || JSON.stringify(currentUnderLock.executionState) !== JSON.stringify(existing.executionState)
+        ) {
+          throw conflict("Issue changed while its governed mutation was being prepared", {
+            code: "governed_issue_compare_and_swap_failed",
+          });
+        }
+        const nextStatus = patch.status ?? existing.status;
+        const guardedAssignmentAgentId =
+          nextAssigneeAgentId
+          && (nextStatus === "todo" || nextStatus === "in_progress")
+          && (
+            issueData.assigneeAgentId !== undefined
+            || patch.status === "todo"
+            || patch.status === "in_progress"
+          )
+            ? nextAssigneeAgentId
+            : null;
+        if (
+          guardedAssignmentAgentId
+        ) {
+          await assertGovernedAssignmentCapacity(tx as unknown as Db, {
+            companyId: existing.companyId,
+            agentId: guardedAssignmentAgentId,
+            excludeIssueId: id,
+          });
+        }
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
@@ -7617,6 +7733,29 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        await authorizeGovernedIssueMutation(tx as unknown as Db, {
+          current: receiptExisting,
+          patch,
+          actorAgentId,
+          actorUserId,
+          source: "issue_update",
+        });
+        if (guardedAssignmentAgentId) {
+          const receiptNextAssigneeAgentId = issueData.assigneeAgentId !== undefined
+            ? issueData.assigneeAgentId
+            : receiptExisting.assigneeAgentId;
+          const receiptNextStatus = patch.status ?? receiptExisting.status;
+          if (
+            (receiptNextStatus === "todo" || receiptNextStatus === "in_progress")
+            && receiptNextAssigneeAgentId !== guardedAssignmentAgentId
+          ) {
+            throw conflict("Issue assignee changed while assignment capacity was evaluated", {
+              code: "assignment_target_changed_retry",
+              expectedAgentId: guardedAssignmentAgentId,
+              observedAgentId: receiptNextAssigneeAgentId,
+            });
+          }
+        }
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])
@@ -7896,6 +8035,28 @@ export function issueService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        const identity = await tx
+          .select({ companyId: issues.companyId })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!identity) return null;
+        await lockGovernedIssueLane(tx as unknown as Db, identity.companyId, id);
+        const controlled = await tx
+          .select({ id: governedIssueBuilderHistory.id })
+          .from(governedIssueBuilderHistory)
+          .where(and(
+            eq(governedIssueBuilderHistory.issueId, id),
+            sql`${governedIssueBuilderHistory.approvalId} is not null`,
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (controlled) {
+          throw conflict("Governed issues are append-retained and cannot be deleted", {
+            code: "governed_issue_deletion_unsupported",
+            issueId: id,
+          });
+        }
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)
@@ -7980,9 +8141,35 @@ export function issueService(db: Db) {
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
+      const updated = await db.transaction(async (tx) => {
+        await lockGovernedIssueLane(tx as unknown as Db, issueCompany.companyId, id);
+        const lockedIssue = await tx
+          .select()
+          .from(issues)
+          .where(eq(issues.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!lockedIssue) return null;
+        const assigneeAllowed = lockedIssue.assigneeAgentId === null || (
+          lockedIssue.assigneeAgentId === agentId
+          && (
+            checkoutRunId
+              ? lockedIssue.checkoutRunId === null || lockedIssue.checkoutRunId === checkoutRunId
+              : lockedIssue.checkoutRunId === null
+          )
+        );
+        const executionAllowed = checkoutRunId
+          ? lockedIssue.executionRunId === null || lockedIssue.executionRunId === checkoutRunId
+          : lockedIssue.executionRunId === null;
+        if (!expectedStatuses.includes(lockedIssue.status) || !assigneeAllowed || !executionAllowed) {
+          return null;
+        }
+        await assertGovernedAssignmentCapacity(tx as unknown as Db, {
+          companyId: issueCompany.companyId,
+          agentId,
+          excludeIssueId: id,
+        });
+        const checkoutPatch: Partial<typeof issues.$inferInsert> = {
           assigneeAgentId: agentId,
           assigneeUserId: null,
           checkoutRunId,
@@ -7990,17 +8177,29 @@ export function issueService(db: Db) {
           status: "in_progress",
           startedAt: now,
           updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+        };
+        await authorizeGovernedIssueMutation(tx as unknown as Db, {
+          current: lockedIssue,
+          patch: checkoutPatch,
+          actorAgentId: agentId,
+          source: "issue_checkout",
+          sourceRunId: checkoutRunId,
+          now,
+        });
+        return tx
+          .update(issues)
+          .set(checkoutPatch)
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);
@@ -8082,7 +8281,7 @@ export function issueService(db: Db) {
         const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId);
         if (stale) {
           const now = new Date();
-          const adoptionSet: Record<string, unknown> = {
+          const adoptionSet: Partial<typeof issues.$inferInsert> = {
             assigneeAgentId: agentId,
             checkoutRunId,
             executionRunId: checkoutRunId,
@@ -8094,19 +8293,47 @@ export function issueService(db: Db) {
           if (current.status !== "in_progress") {
             adoptionSet.startedAt = now;
           }
-          const adopted = await db
-            .update(issues)
-            .set(adoptionSet)
-            .where(
-              and(
-                eq(issues.id, id),
-                inArray(issues.status, expectedStatuses),
-                eq(issues.executionRunId, current.executionRunId),
-                or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
+          const adopted = await db.transaction(async (tx) => {
+            await lockGovernedIssueLane(tx as unknown as Db, issueCompany.companyId, id);
+            const lockedIssue = await tx
+              .select()
+              .from(issues)
+              .where(eq(issues.id, id))
+              .for("update")
+              .then((rows) => rows[0] ?? null);
+            if (
+              !lockedIssue
+              || lockedIssue.executionRunId !== current.executionRunId
+              || !expectedStatuses.includes(lockedIssue.status)
+              || (lockedIssue.assigneeAgentId !== null && lockedIssue.assigneeAgentId !== agentId)
+            ) return null;
+            await assertGovernedAssignmentCapacity(tx as unknown as Db, {
+              companyId: issueCompany.companyId,
+              agentId,
+              excludeIssueId: id,
+            });
+            await authorizeGovernedIssueMutation(tx as unknown as Db, {
+              current: lockedIssue,
+              patch: adoptionSet,
+              actorAgentId: agentId,
+              source: "stale_execution_adoption",
+              sourceRunId: checkoutRunId,
+              now,
+            });
+            return tx
+              .update(issues)
+              .set(adoptionSet)
+              .where(
+                and(
+                  eq(issues.id, id),
+                  inArray(issues.status, expectedStatuses),
+                  eq(issues.executionRunId, current.executionRunId!),
+                  or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, agentId)),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+          });
           if (adopted) {
             const [enriched] = await withIssueLabels(db, [adopted]);
             return enriched;
@@ -8281,13 +8508,15 @@ export function issueService(db: Db) {
 
     release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>
       db.transaction(async (tx) => {
-        await tx.execute(
-          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
-        );
+        const identity = await tx.select({ companyId: issues.companyId }).from(issues)
+          .where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
+        if (!identity) return null;
+        await lockGovernedIssueLane(tx as unknown as Db, identity.companyId, id);
         const existing = await tx
           .select()
           .from(issues)
           .where(eq(issues.id, id))
+          .for("update")
           .then((rows) => rows[0] ?? null);
 
         if (!existing) return null;
@@ -8314,17 +8543,25 @@ export function issueService(db: Db) {
 
         // Release clears checkout/assignee locks; only in_progress work re-queues to todo.
         const releaseStatus = existing.status === "in_progress" ? "todo" : existing.status;
+        const releasePatch: Partial<typeof issues.$inferInsert> = {
+          status: releaseStatus,
+          assigneeAgentId: null,
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        };
+        await authorizeGovernedIssueMutation(tx as unknown as Db, {
+          current: existing,
+          patch: releasePatch,
+          actorAgentId,
+          source: "issue_release",
+          sourceRunId: actorRunId ?? null,
+        });
         const updated = await tx
           .update(issues)
-          .set({
-            status: releaseStatus,
-            assigneeAgentId: null,
-            checkoutRunId: null,
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: new Date(),
-          })
+          .set(releasePatch)
           .where(eq(issues.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
@@ -8335,17 +8572,15 @@ export function issueService(db: Db) {
 
     adminForceRelease: async (id: string, options: { clearAssignee?: boolean } = {}) =>
       db.transaction(async (tx) => {
-        await tx.execute(
-          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
-        );
+        const identity = await tx.select({ companyId: issues.companyId }).from(issues)
+          .where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
+        if (!identity) return null;
+        await lockGovernedIssueLane(tx as unknown as Db, identity.companyId, id);
         const existing = await tx
-          .select({
-            id: issues.id,
-            checkoutRunId: issues.checkoutRunId,
-            executionRunId: issues.executionRunId,
-          })
+          .select()
           .from(issues)
           .where(eq(issues.id, id))
+          .for("update")
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
@@ -8359,6 +8594,11 @@ export function issueService(db: Db) {
         if (options.clearAssignee) {
           patch.assigneeAgentId = null;
         }
+        await authorizeGovernedIssueMutation(tx as unknown as Db, {
+          current: existing,
+          patch,
+          source: "admin_force_release",
+        });
 
         const updated = await tx
           .update(issues)

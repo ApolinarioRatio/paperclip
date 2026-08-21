@@ -12,6 +12,7 @@ import {
   costEvents,
   heartbeatRunEvents,
   heartbeatRuns,
+  governedIssueBuilderHistory,
   issueExecutionDecisions,
   issues,
   issueComments,
@@ -30,6 +31,10 @@ import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import { secretService } from "./secrets.js";
+import {
+  assertGovernedPolicyActivationCapacity,
+  hasGovernedSingleActiveAssignmentPolicy,
+} from "./governed-queue-assignment.js";
 import {
   builtInAgentMarkersEqual,
   readBuiltInAgentMarker,
@@ -532,6 +537,15 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+      if (
+        Object.prototype.hasOwnProperty.call(normalizedPatch, "runtimeConfig")
+        && hasGovernedSingleActiveAssignmentPolicy(normalizedPatch.runtimeConfig)
+      ) {
+        await assertGovernedPolicyActivationCapacity(txDb, {
+          companyId: existing.companyId,
+          agentId: id,
+        });
+      }
       const updated = await txDb
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
@@ -753,6 +767,18 @@ export function agentService(db: Db) {
           .from(agents)
           .where(eq(agents.id, id))
           .for("update");
+        const governedHistory = await tx
+          .select({ issueId: governedIssueBuilderHistory.issueId })
+          .from(governedIssueBuilderHistory)
+          .where(eq(governedIssueBuilderHistory.agentId, id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (governedHistory) {
+          throw conflict("Agents recorded in governed builder/verifier history cannot be deleted", {
+            code: "governed_issue_history_retention_required",
+            issueId: governedHistory.issueId,
+          });
+        }
         await issueThreadInteractionService(tx as unknown as Db)
           .cancelPendingForDeletedAddressee(existing.companyId, id);
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));

@@ -23,6 +23,7 @@ import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../services/recovery/review-path-recovery.js";
+import { prepareGovernedQueueApprovalPayload } from "../services/governed-queue-dispatch.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -231,17 +232,58 @@ export function approvalRoutes(
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
-    const { issueIds: _issueIds, ...approvalInput } = req.body;
-    const normalizedPayload =
-      approvalInput.type === "hire_agent"
-        ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
-            companyId,
-            approvalInput.payload,
-            { strictMode: strictSecretsMode },
-          )
-        : approvalInput.payload;
-
     const actor = getActorInfo(req);
+    const { issueIds: _issueIds, ...approvalInput } = req.body;
+    let normalizedPayload: Record<string, unknown>;
+    if (approvalInput.type === "hire_agent") {
+      normalizedPayload = await secretsSvc.normalizeHireApprovalPayloadForPersistence(
+        companyId,
+        approvalInput.payload,
+        { strictMode: strictSecretsMode },
+      );
+    } else if (approvalInput.type === "governed_queue_dispatch") {
+      if (
+        actor.actorType !== "agent"
+        || !actor.agentId
+        || (approvalInput.requestedByAgentId && approvalInput.requestedByAgentId !== actor.agentId)
+      ) {
+        res.status(403).json({ error: "Governed queue approvals require their authenticated agent owner" });
+        return;
+      }
+      const assignmentDecision = await access.decide({
+        actor: req.actor,
+        action: "tasks:assign",
+        resource: { type: "company", companyId },
+      });
+      if (!assignmentDecision.allowed) {
+        res.status(403).json({ error: "Governed queue approval owner lacks tasks:assign" });
+        return;
+      }
+      if (uniqueIssueIds.length !== 1) {
+        res.status(422).json({ error: "Governed queue approvals require exactly one linked issue" });
+        return;
+      }
+      const request = approvalInput.payload.queueDispatchRequest;
+      if (!request || typeof request !== "object" || Array.isArray(request)) {
+        res.status(422).json({ error: "Governed queue approval payload requires queueDispatchRequest" });
+        return;
+      }
+      const queueRequest = request as Record<string, unknown>;
+      normalizedPayload = await prepareGovernedQueueApprovalPayload(db, {
+        companyId,
+        issueId: uniqueIssueIds[0]!,
+        authorityAgentId: actor.agentId,
+        expectedUpdatedAt: typeof queueRequest.expectedUpdatedAt === "string" ? queueRequest.expectedUpdatedAt : "",
+        approvalMarker: typeof queueRequest.approvalMarker === "string" ? queueRequest.approvalMarker : "",
+        targetAgentId: typeof queueRequest.targetAgentId === "string" ? queueRequest.targetAgentId : "",
+        expiresAt: typeof queueRequest.expiresAt === "string" ? queueRequest.expiresAt : "",
+        idempotencyKey: typeof queueRequest.idempotencyKey === "string" ? queueRequest.idempotencyKey : "",
+        maxDispatches: typeof queueRequest.maxDispatches === "number" ? queueRequest.maxDispatches : 3,
+      }, approvalInput.payload);
+    } else {
+      normalizedPayload = approvalInput.payload;
+    }
+
     const approval = await svc.create(companyId, {
       ...approvalInput,
       payload: normalizedPayload,

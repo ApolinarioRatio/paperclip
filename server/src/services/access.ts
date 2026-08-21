@@ -2,6 +2,7 @@ import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companyMemberships,
+  governedIssueBuilderHistory,
   instanceUserRoles,
   issues,
   principalPermissionGrants,
@@ -10,6 +11,7 @@ import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
+import { assertGovernedAssignmentCapacity } from "./governed-queue-assignment.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
@@ -356,16 +358,57 @@ export function accessService(db: Db) {
       await assertAssignableArchiveTarget(companyId, input.reassignment, tx);
 
       const now = new Date();
-      const assignmentPatch = {
-        assigneeAgentId: input.reassignment?.assigneeAgentId ?? null,
-        assigneeUserId: input.reassignment?.assigneeUserId ?? null,
-        updatedAt: now,
-      };
       const assignedOpenIssueWhere = and(
         eq(issues.companyId, companyId),
         eq(issues.assigneeUserId, existing.principalId),
         sql`${issues.status} not in ('done', 'cancelled')`,
       );
+      // Global lock order is task rows first, then a governed agent lane.
+      // Re-read/count from this locked set so reassignment cannot use stale
+      // pre-lock state or deadlock against task->agent issue mutations.
+      const assignedOpenIssues = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(assignedOpenIssueWhere)
+        .orderBy(issues.id)
+        .for("update");
+      const activeVerifierReservation = await tx
+        .select({ issueId: governedIssueBuilderHistory.issueId })
+        .from(governedIssueBuilderHistory)
+        .where(and(
+          eq(governedIssueBuilderHistory.companyId, companyId),
+          eq(governedIssueBuilderHistory.userId, existing.principalId),
+          eq(governedIssueBuilderHistory.kind, "verification_reservation"),
+          eq(governedIssueBuilderHistory.state, "active"),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (activeVerifierReservation) {
+        throw conflict("An active governed verifier reservation must be resolved before archiving the member", {
+          code: "governed_verifier_reservation_active",
+          issueId: activeVerifierReservation.issueId,
+        });
+      }
+      if (input.reassignment?.assigneeAgentId) {
+        const capacity = await assertGovernedAssignmentCapacity(tx as unknown as Db, {
+          companyId,
+          agentId: input.reassignment.assigneeAgentId,
+        });
+        if (capacity.enforced) {
+          const reassignmentCount = assignedOpenIssues.length;
+          if (reassignmentCount > 1) {
+            throw conflict("Governed single-assignment target cannot receive a bulk reassignment", {
+              code: "target_has_execution_load",
+              incomingIssueCount: reassignmentCount,
+            });
+          }
+        }
+      }
+      const assignmentPatch = {
+        assigneeAgentId: input.reassignment?.assigneeAgentId ?? null,
+        assigneeUserId: input.reassignment?.assigneeUserId ?? null,
+        updatedAt: now,
+      };
       const resetInProgress = await tx
         .update(issues)
         .set({

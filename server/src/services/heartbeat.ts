@@ -126,7 +126,11 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
-import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import { logActivity, publishActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import {
+  governedQueueDispatchService,
+  type GovernedQueueDispatchInput,
+} from "./governed-queue-dispatch.js";
 import {
   buildWorkspaceReadyComment,
   buildWorkspaceReadyMetadata,
@@ -18674,7 +18678,78 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await cancelPendingWakeupsForBudgetScope(scope);
   }
 
+  async function governedQueueDispatch(
+    input: Omit<GovernedQueueDispatchInput, "responsibleUserId" | "sessionIdBefore" | "now">,
+  ) {
+    const agent = await getAgent(input.targetAgentId);
+    if (!agent || agent.companyId !== input.companyId) {
+      throw notFound("Target agent not found");
+    }
+    const issueContext = await getIssueExecutionContext(input.companyId, input.issueId);
+    if (!issueContext) throw notFound("Issue not found");
+
+    const policy = parseHeartbeatPolicy(agent);
+    if (!policy.wakeOnDemand || policy.maxConcurrentRuns !== 1) {
+      throw conflict("Target must enable on-demand wakeups with maxConcurrentRuns set to 1", {
+        code: "target_queue_runtime_policy_mismatch",
+        wakeOnDemand: policy.wakeOnDemand,
+        maxConcurrentRuns: policy.maxConcurrentRuns,
+      });
+    }
+    const contextSnapshot = {
+      issueId: input.issueId,
+      taskId: input.issueId,
+      taskKey: `issue:${input.issueId}`,
+      wakeReason: "governed_queue_dispatch",
+      wakeSource: "automation",
+      wakeTriggerDetail: "system",
+      approvalId: input.approvalId,
+      authorityAgentId: input.authorityAgentId,
+      targetAgentId: input.targetAgentId,
+    };
+    const routineEnvContext = await getRoutineEnvForExecutionIssue(input.companyId, issueContext);
+    const responsibleUserId = await resolveResponsibleUserIdForRunSeed({
+      companyId: input.companyId,
+      contextSnapshot,
+      issueContext,
+      routineEnvContext,
+      requestedByActorType: "agent",
+      requestedByActorId: input.authorityAgentId,
+      source: "automation",
+      triggerDetail: "system",
+    });
+    if (!responsibleUserId) {
+      throw new HttpError(422, "Unable to resolve responsible user for governed queue dispatch", {
+        code: "responsible_user_unresolved",
+        issueId: input.issueId,
+        agentId: input.targetAgentId,
+      });
+    }
+    const sessionIdBefore = await resolveSessionBeforeForWakeup(agent, `issue:${input.issueId}`);
+    const result = await governedQueueDispatchService(db).dispatch({
+      ...input,
+      responsibleUserId,
+      sessionIdBefore,
+    });
+
+    for (const publication of result.publications) publishActivity(publication);
+    if (!result.idempotent) {
+      publishLiveEvent({
+        companyId: result.run.companyId,
+        type: "heartbeat.run.queued",
+        payload: {
+          runId: result.run.id,
+          agentId: result.run.agentId,
+          invocationSource: result.run.invocationSource,
+        },
+      });
+    }
+    await startNextQueuedRunForAgent(input.targetAgentId);
+    return result;
+  }
+
   return {
+    governedQueueDispatch,
     waitForRunExecutionDrain: async (
       runId: string,
       options: { timeoutMs?: number; intervalMs?: number } = {},

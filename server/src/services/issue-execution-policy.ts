@@ -525,6 +525,10 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     completedStageIds,
     lastDecisionId: previous?.lastDecisionId ?? null,
     lastDecisionOutcome: "approved",
+    verificationReservedAt: null,
+    verificationExpiresAt: null,
+    verificationPolicyDigest: null,
+    verificationReservationId: null,
     monitor: previous?.monitor ?? null,
     changesRequestedCount: 0,
   };
@@ -546,6 +550,10 @@ function buildStateWithCompletedStages(input: {
     completedStageIds: input.completedStageIds,
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
+    verificationReservedAt: input.previous?.verificationReservedAt ?? null,
+    verificationExpiresAt: input.previous?.verificationExpiresAt ?? null,
+    verificationPolicyDigest: input.previous?.verificationPolicyDigest ?? null,
+    verificationReservationId: input.previous?.verificationReservationId ?? null,
     monitor: input.previous?.monitor ?? null,
   };
 }
@@ -566,6 +574,10 @@ function buildSkippedStageCompletedState(input: {
     completedStageIds: input.completedStageIds,
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
+    verificationReservedAt: null,
+    verificationExpiresAt: null,
+    verificationPolicyDigest: null,
+    verificationReservationId: null,
     monitor: input.previous?.monitor ?? null,
   };
 }
@@ -590,6 +602,10 @@ function buildPendingState(input: {
     completedStageIds: input.previous?.completedStageIds ?? [],
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
+    verificationReservedAt: null,
+    verificationExpiresAt: null,
+    verificationPolicyDigest: null,
+    verificationReservationId: null,
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
   };
@@ -607,6 +623,10 @@ function buildChangesRequestedState(
     currentStageType: currentStage.type,
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
+    verificationReservedAt: null,
+    verificationExpiresAt: null,
+    verificationPolicyDigest: null,
+    verificationReservationId: null,
     changesRequestedCount,
   };
 }
