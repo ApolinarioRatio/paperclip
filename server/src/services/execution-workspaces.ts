@@ -2430,6 +2430,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         let restoredSourceIssue: ExecutionWorkspaceBranchReconcileResult["restoredSourceIssue"] = null;
         let sourceIssueStatusChanged = false;
         if (input.mode === "quarantine_restore") {
+          const { lockGovernedIssueLane } = await import("./governed-issue-separation.js");
+          await lockGovernedIssueLane(
+            txDb,
+            lockedWorkspace.companyId,
+            lockedWorkspace.sourceIssueId,
+          );
           const [sourceBefore] = await tx
             .select({
               id: issues.id,

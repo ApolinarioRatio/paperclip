@@ -30,6 +30,7 @@ import {
   createIssueLabelSchema,
   addIssueCommentSchema,
   checkoutIssueSchema,
+  governedQueueDispatchSchema,
   linkIssueApprovalSchema,
   createIssueWorkProductSchema,
   updateIssueWorkProductSchema,
@@ -731,6 +732,7 @@ const AUTHENTICATED_SECURITY: Array<Record<string, string[]>> = [
 
 const PUBLIC_OPERATIONS = new Set([
   "GET /api/health",
+  "GET /api/health/runtime-build",
   "GET /api/openapi.json",
   "GET /api/board-claim/{token}",
   "POST /api/cli-auth/challenges",
@@ -1176,6 +1178,19 @@ registry.registerPath({
         },
       },
     },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/health/runtime-build",
+  tags: ["health"],
+  summary: "Governed queue runtime build marker",
+  responses: {
+    200: r.ok(z.object({
+      runtimeBuildId: z.string(),
+      baseCommit: z.string(),
+    }).strict()),
   },
 });
 
@@ -2371,6 +2386,27 @@ registry.registerPath({
   summary: "Unlink an approval from an issue",
   request: { params: z.object({ id: z.string(), approvalId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/governed-queue-dispatch",
+  tags: ["issues"],
+  summary: "Atomically authorize, claim, and wake governed queue work",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(governedQueueDispatchSchema),
+  },
+  responses: {
+    200: r.ok(),
+    201: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    412: { description: "Precondition failed" },
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({

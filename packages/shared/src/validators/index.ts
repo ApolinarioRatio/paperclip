@@ -418,6 +418,8 @@ export {
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
+  governedQueueDispatchSchema,
+  type GovernedQueueDispatch,
   issueCommentAuthorTypeSchema,
   issueCommentPresentationSchema,
   issueCommentMetadataRowSchema,

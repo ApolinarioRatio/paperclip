@@ -288,6 +288,10 @@ export const issueExecutionStateSchema = z.object({
   completedStageIds: z.array(z.string().uuid()).default([]),
   lastDecisionId: z.string().uuid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
+  verificationReservedAt: z.string().datetime().nullable().optional().default(null),
+  verificationExpiresAt: z.string().datetime().nullable().optional().default(null),
+  verificationPolicyDigest: z.string().regex(/^[0-9a-f]{64}$/).nullable().optional().default(null),
+  verificationReservationId: z.string().uuid().nullable().optional().default(null),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
 });
@@ -575,6 +579,17 @@ export const checkoutIssueSchema = z.object({
   agentId: z.string().uuid(),
   expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
 });
+
+export const governedQueueDispatchSchema = z.object({
+  expectedUpdatedAt: z.string().datetime({ offset: true }),
+  approvalId: z.string().uuid(),
+  approvalMarker: z.string().trim().min(1).max(200).regex(/^[^\r\n]+$/),
+  targetAgentId: z.string().uuid(),
+  expiresAt: z.string().datetime({ offset: true }),
+  idempotencyKey: z.string().trim().min(1).max(200),
+}).strict();
+
+export type GovernedQueueDispatch = z.infer<typeof governedQueueDispatchSchema>;
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 

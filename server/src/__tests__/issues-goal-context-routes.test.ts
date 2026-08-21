@@ -54,6 +54,7 @@ const mockFeedbackService = vi.hoisted(() => ({
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
+  governedQueueDispatch: vi.fn(),
   wakeup: vi.fn(async () => undefined),
   reportRunActivity: vi.fn(async () => undefined),
 }));
@@ -139,17 +140,17 @@ vi.mock("../services/execution-workspaces.js", () => ({
   executionWorkspaceService: () => mockExecutionWorkspaceService,
 }));
 
-function createApp() {
+function createApp(actor: Record<string, unknown> = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+}) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes(mockDb as any, {} as any));
@@ -537,6 +538,100 @@ describe.sequential("issue goal context routes", () => {
           url: "http://127.0.0.1:5173",
         }),
       ],
+    }));
+  });
+
+  it("rejects local implicit board authority for governed queue dispatch", async () => {
+    const res = await request(createApp())
+      .post(`/api/issues/${legacyProjectLinkedIssue.id}/governed-queue-dispatch`)
+      .send({
+        expectedUpdatedAt: legacyProjectLinkedIssue.updatedAt.toISOString(),
+        approvalId: "55555555-5555-4555-8555-555555555555",
+        approvalMarker: "RATA-1:approved",
+        targetAgentId: "66666666-6666-4666-8666-666666666666",
+        expiresAt: "2026-08-21T05:00:00.000Z",
+        idempotencyKey: "rata-1-qwen-v1",
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockHeartbeatService.governedQueueDispatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects authenticated board sessions for governed queue dispatch", async () => {
+    const res = await request(createApp({
+      type: "board",
+      userId: "alex",
+      companyIds: ["company-1"],
+      source: "session",
+      isInstanceAdmin: true,
+    }))
+      .post(`/api/issues/${legacyProjectLinkedIssue.id}/governed-queue-dispatch`)
+      .send({
+        expectedUpdatedAt: legacyProjectLinkedIssue.updatedAt.toISOString(),
+        approvalId: "55555555-5555-4555-8555-555555555555",
+        approvalMarker: "RATA-1:approved",
+        targetAgentId: "66666666-6666-4666-8666-666666666666",
+        expiresAt: "2026-08-21T05:00:00.000Z",
+        idempotencyKey: "rata-1-qwen-v1",
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockHeartbeatService.governedQueueDispatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a caller-supplied queue ceiling", async () => {
+    const res = await request(createApp({
+      type: "agent",
+      agentId: "77777777-7777-4777-8777-777777777777",
+      companyId: "company-1",
+      source: "agent_key",
+    }))
+      .post(`/api/issues/${legacyProjectLinkedIssue.id}/governed-queue-dispatch`)
+      .send({
+        expectedUpdatedAt: legacyProjectLinkedIssue.updatedAt.toISOString(),
+        approvalId: "55555555-5555-4555-8555-555555555555",
+        approvalMarker: "RATA-1:approved",
+        targetAgentId: "66666666-6666-4666-8666-666666666666",
+        expiresAt: "2026-08-21T05:00:00.000Z",
+        idempotencyKey: "rata-1-qwen-v1",
+        maxDispatches: 99,
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockHeartbeatService.governedQueueDispatch).not.toHaveBeenCalled();
+  });
+
+  it("derives governed queue authority from the authenticated agent and fixes the server cap at three", async () => {
+    const authorityAgentId = "77777777-7777-4777-8777-777777777777";
+    mockHeartbeatService.governedQueueDispatch.mockResolvedValue({
+      idempotent: false,
+      issue: { id: legacyProjectLinkedIssue.id },
+      run: { id: "run-1" },
+      wakeupRequest: { id: "wake-1" },
+      publications: [],
+    });
+    const res = await request(createApp({
+      type: "agent",
+      agentId: authorityAgentId,
+      companyId: "company-1",
+      source: "agent_key",
+    }))
+      .post(`/api/issues/${legacyProjectLinkedIssue.id}/governed-queue-dispatch`)
+      .send({
+        expectedUpdatedAt: legacyProjectLinkedIssue.updatedAt.toISOString(),
+        approvalId: "55555555-5555-4555-8555-555555555555",
+        approvalMarker: "RATA-1:approved",
+        targetAgentId: "66666666-6666-4666-8666-666666666666",
+        expiresAt: "2026-08-21T05:00:00.000Z",
+        idempotencyKey: "rata-1-qwen-v1",
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockHeartbeatService.governedQueueDispatch).toHaveBeenCalledWith(expect.objectContaining({
+      authorityAgentId,
+      maxDispatches: 3,
+      companyId: "company-1",
+      issueId: legacyProjectLinkedIssue.id,
     }));
   });
 });

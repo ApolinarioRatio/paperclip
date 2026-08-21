@@ -21,6 +21,8 @@ import {
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { serverVersion } from "../version.js";
 
+const RUNTIME_BUILD_ID = "rata2110-governed-queue-v2";
+
 function shouldExposeFullHealthDetails(
   actorType: "none" | "board" | "agent" | null | undefined,
   deploymentMode: DeploymentMode,
@@ -124,6 +126,13 @@ export function healthRoutes(
     }
 
     res.status(202).json({ status: "restart_requested" });
+  });
+
+  router.get("/runtime-build", (_req, res) => {
+    res.json({
+      runtimeBuildId: RUNTIME_BUILD_ID,
+      baseCommit: "213dabab4f8e1f3bb1803a2924c0fea1289fcd4c",
+    });
   });
 
   router.get("/", async (req, res) => {

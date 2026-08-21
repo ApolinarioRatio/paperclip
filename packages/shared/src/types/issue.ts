@@ -713,6 +713,10 @@ export interface IssueExecutionState {
   completedStageIds: string[];
   lastDecisionId: string | null;
   lastDecisionOutcome: IssueExecutionDecisionOutcome | null;
+  verificationReservedAt?: string | null;
+  verificationExpiresAt?: string | null;
+  verificationPolicyDigest?: string | null;
+  verificationReservationId?: string | null;
   monitor?: IssueExecutionMonitorState | null;
   /** Consecutive agent-initiated changes-requested rounds on the current stage. */
   changesRequestedCount?: number;

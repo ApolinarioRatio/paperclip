@@ -40,6 +40,7 @@ import {
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
+  governedQueueDispatchSchema,
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
@@ -166,6 +167,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { lockGovernedIssueDecisionLane } from "../services/governed-issue-separation.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
@@ -8929,13 +8931,15 @@ export function issueRoutes(
       if (transition.decision && decisionId) {
         const decision = transition.decision;
         issue = await db.transaction(async (tx) => {
-          const updated = await updateIssue(tx);
-          if (!updated) return null;
-
+          await lockGovernedIssueDecisionLane(tx as unknown as Db, {
+            companyId: existing.companyId,
+            issueId: existing.id,
+            expected: existing,
+          });
           await tx.insert(issueExecutionDecisions).values({
             id: decisionId,
-            companyId: updated.companyId,
-            issueId: updated.id,
+            companyId: existing.companyId,
+            issueId: existing.id,
             stageId: decision.stageId,
             stageType: decision.stageType,
             actorAgentId: actor.agentId ?? null,
@@ -8943,7 +8947,10 @@ export function issueRoutes(
             outcome: decision.outcome,
             body: decision.body,
             createdByRunId: actor.runId ?? null,
+            reservationId: parseIssueExecutionState(existing.executionState)?.verificationReservationId ?? null,
           });
+          const updated = await updateIssue(tx);
+          if (!updated) throw notFound("Issue not found");
 
           if (shouldRelayStop) {
             stopRelayResult.value = await svc.addStopRelayCommentIfNeeded(updated, tx);
@@ -9942,6 +9949,40 @@ export function issueRoutes(
     await queueTaskWatchdogEvaluation(existing, actor.runId);
     res.json(issue);
   });
+
+  router.post(
+    "/issues/:id/governed-queue-dispatch",
+    validate(governedQueueDispatchSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (req.actor.type !== "agent" || !req.actor.agentId || req.actor.companyId !== issue.companyId) {
+        throw forbidden("Governed queue dispatch requires an authenticated company agent");
+      }
+      await assertCanAssignTasks(req, issue.companyId, {
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: req.body.targetAgentId,
+        assigneeUserId: null,
+      });
+      const result = await heartbeat.governedQueueDispatch({
+        issueId: issue.id,
+        companyId: issue.companyId,
+        expectedUpdatedAt: req.body.expectedUpdatedAt,
+        approvalId: req.body.approvalId,
+        approvalMarker: req.body.approvalMarker,
+        targetAgentId: req.body.targetAgentId,
+        authorityAgentId: req.actor.agentId,
+        maxDispatches: 3,
+        expiresAt: req.body.expiresAt,
+        idempotencyKey: req.body.idempotencyKey,
+      });
+      const { publications: _publications, ...response } = result;
+      res.status(result.idempotent ? 200 : 201).json(response);
+    },
+  );
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {
     const id = req.params.id as string;
@@ -11228,6 +11269,11 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
       try {
         txResult = await db.transaction(async (tx) => {
+          await lockGovernedIssueDecisionLane(tx as unknown as Db, {
+            companyId: currentIssue.companyId,
+            issueId: id,
+            expected: currentIssue,
+          });
           const insertedComment = await svc.addComment(
             id,
             req.body.body,
@@ -11240,18 +11286,11 @@ export function issueRoutes(
             { ...commentOptions, authorizationReason: commentAuthorizationReason },
             tx,
           );
-          const updated = actor.actorType === "user" && currentIssue.status !== "done"
-            ? await svc.update(id, updatePatch, tx, postCommitActivityPublications)
-            : await svc.update(id, updatePatch, tx);
-          // Throw (not return null) so drizzle rolls back the inserted comment when the issue
-          // has been concurrently deleted between the initial fetch and the in-transaction update.
-          if (!updated) throw new AutoApprovalIssueMissingError();
-
           if (transition.decision && decisionId) {
             await tx.insert(issueExecutionDecisions).values({
               id: decisionId,
-              companyId: updated.companyId,
-              issueId: updated.id,
+              companyId: currentIssue.companyId,
+              issueId: currentIssue.id,
               stageId: transition.decision.stageId,
               stageType: transition.decision.stageType,
               actorAgentId: actor.agentId ?? null,
@@ -11259,8 +11298,15 @@ export function issueRoutes(
               outcome: transition.decision.outcome,
               body: transition.decision.body,
               createdByRunId: actor.runId ?? null,
+              reservationId: currentExecutionState.verificationReservationId ?? null,
             });
           }
+          const updated = actor.actorType === "user" && currentIssue.status !== "done"
+            ? await svc.update(id, updatePatch, tx, postCommitActivityPublications)
+            : await svc.update(id, updatePatch, tx);
+          // Throw (not return null) so drizzle rolls back the inserted comment when the issue
+          // has been concurrently deleted between the initial fetch and the in-transaction update.
+          if (!updated) throw new AutoApprovalIssueMissingError();
 
           return { comment: insertedComment, issue: updated };
         });
