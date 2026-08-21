@@ -306,6 +306,8 @@ export {
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
   conditionalQueueClaimSchema,
+  conditionalQueueApprovalMarkerSchema,
+  conditionalQueueWakeReservationSchema,
   issueCommentAuthorTypeSchema,
   issueCommentPresentationSchema,
   issueCommentMetadataRowSchema,
