@@ -556,6 +556,7 @@ export function governedQueueDispatchService(db: Db) {
             .from(agentWakeupRequests)
             .where(and(
               eq(agentWakeupRequests.companyId, input.companyId),
+              eq(agentWakeupRequests.reason, "governed_queue_dispatch"),
               inArray(agentWakeupRequests.status, [...LIVE_WAKE_STATUSES]),
               isNull(agentWakeupRequests.runId),
             ))

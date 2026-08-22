@@ -21,7 +21,7 @@ import {
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { serverVersion } from "../version.js";
 
-const RUNTIME_BUILD_ID = "rata2110-governed-queue-v2";
+const RUNTIME_BUILD_ID = "rata2110-governed-queue-v3";
 
 function shouldExposeFullHealthDetails(
   actorType: "none" | "board" | "agent" | null | undefined,

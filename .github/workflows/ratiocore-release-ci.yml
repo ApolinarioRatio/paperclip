@@ -1,0 +1,54 @@
+name: RatioCore release CI
+
+on:
+  pull_request:
+    branches:
+      - "release/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ratiocore-release-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: RatioCore release CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck server
+        run: pnpm --filter @paperclipai/server typecheck
+
+      - name: Run governed release regression tests
+        run: >-
+          pnpm exec vitest run
+          server/src/__tests__/health.test.ts
+          server/src/__tests__/governed-queue-dispatch.test.ts
+          server/src/__tests__/issue-comment-reopen-routes.test.ts
+
+      - name: Build workspaces
+        run: pnpm build
