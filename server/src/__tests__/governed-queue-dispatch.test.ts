@@ -1011,6 +1011,40 @@ describeEmbeddedPostgres("governedQueueDispatchService", () => {
     expect(issue).toMatchObject({ status: "todo", assigneeAgentId: null });
   });
 
+  it("ignores unrelated deferred wake requests when enforcing the governed queue-path cap", async () => {
+    const fixture = await seedDispatchFixture();
+    await db.insert(agentWakeupRequests).values([0, 1, 2].map((index) => ({
+      companyId: fixture.companyId,
+      agentId: fixture.authorityAgentId,
+      source: index % 2 === 0 ? "assignment" : "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+    })));
+
+    const result = await governedQueueDispatchService(db).dispatch(dispatchInput(fixture));
+
+    expect(result.idempotent).toBe(false);
+    expect(result.run.status).toBe("queued");
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(4);
+  });
+
+  it("counts orphan governed queue wake requests against the governed queue-path cap", async () => {
+    const fixture = await seedDispatchFixture();
+    await db.insert(agentWakeupRequests).values([0, 1, 2].map(() => ({
+      companyId: fixture.companyId,
+      agentId: fixture.authorityAgentId,
+      source: "automation",
+      reason: "governed_queue_dispatch",
+      status: "queued",
+    })));
+
+    await expect(governedQueueDispatchService(db).dispatch(dispatchInput(fixture)))
+      .rejects.toMatchObject({ status: 409, details: { code: "max_dispatches_reached", observed: 3, limit: 3 } });
+    const issue = await db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]);
+    expect(issue).toMatchObject({ status: "todo", assigneeAgentId: null });
+  });
+
   it("rejects authorization lifetimes above the server-owned fifteen-minute ceiling", async () => {
     const fixture = await seedDispatchFixture();
     await expect(governedQueueDispatchService(db).dispatch({
