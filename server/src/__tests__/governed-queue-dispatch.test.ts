@@ -1335,6 +1335,94 @@ describeEmbeddedPostgres("governedQueueDispatchService", () => {
     expect(assigned).toHaveLength(1);
   });
 
+  it("CAS roundtrip: dispatch succeeds using the ms-precision updatedAt returned by issueService.create", async () => {
+    // Seed infrastructure (company + agents) but NOT the issue.
+    const fixture = await seedDispatchFixture();
+
+    // Create the issue via the service — caller does not supply updatedAt.
+    // Before the fix PostgreSQL's defaultNow() stores microsecond precision
+    // (e.g. 10:00:00.123456) while the JS Date returned to the caller is
+    // truncated to milliseconds (10:00:00.123).  The SQL CAS WHERE clause then
+    // compares the ms value against the stored μs value and finds no match,
+    // raising queue_dispatch_compare_and_swap_failed with no intervening write.
+    const createdIssue = await issueService(db).create(fixture.companyId, {
+      title: "CAS precision regression issue",
+      status: "todo",
+      priority: "high",
+      responsibleUserId: "alex",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: randomUUID(),
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: fixture.verifierAgentId }],
+        }],
+      },
+    });
+
+    // Simulate exactly what the API serialises to the caller and what the
+    // caller then echoes back as expectedUpdatedAt — toISOString() is ms only.
+    const msUpdatedAt = createdIssue.updatedAt instanceof Date
+      ? createdIssue.updatedAt.toISOString()
+      : new Date(createdIssue.updatedAt as string).toISOString();
+
+    const casApprovalId = randomUUID();
+    const dispatchNow = new Date("2026-08-22T12:04:00.000Z");
+    const expiresAt = "2026-08-22T12:15:00.000Z";
+
+    const approvalPayload = await prepareGovernedQueueApprovalPayload(db, {
+      companyId: fixture.companyId,
+      issueId: createdIssue.id,
+      expectedUpdatedAt: msUpdatedAt,
+      approvalMarker: "CAS-PRECISION:alex-approved",
+      targetAgentId: fixture.targetAgentId,
+      authorityAgentId: fixture.authorityAgentId,
+      maxDispatches: 1,
+      expiresAt,
+      idempotencyKey: "cas-precision-regression-v1",
+      now: dispatchNow,
+    }, { purpose: "governed_queue_dispatch" });
+
+    await db.insert(approvals).values({
+      id: casApprovalId,
+      companyId: fixture.companyId,
+      type: "governed_queue_dispatch",
+      status: "pending",
+      requestedByAgentId: fixture.authorityAgentId,
+      payload: approvalPayload,
+      createdAt: dispatchNow,
+      updatedAt: dispatchNow,
+    });
+    await db.insert(issueApprovals).values({
+      companyId: fixture.companyId,
+      issueId: createdIssue.id,
+      approvalId: casApprovalId,
+      linkedByAgentId: fixture.authorityAgentId,
+    });
+
+    const result = await governedQueueDispatchService(db).dispatch({
+      issueId: createdIssue.id,
+      companyId: fixture.companyId,
+      expectedUpdatedAt: msUpdatedAt,
+      approvalId: casApprovalId,
+      approvalMarker: "CAS-PRECISION:alex-approved",
+      targetAgentId: fixture.targetAgentId,
+      authorityAgentId: fixture.authorityAgentId,
+      maxDispatches: 1,
+      expiresAt,
+      idempotencyKey: "cas-precision-regression-v1",
+      now: new Date("2026-08-22T12:05:00.000Z"),
+      responsibleUserId: "alex",
+      sessionIdBefore: null,
+    });
+
+    expect(result.idempotent).toBe(false);
+    expect(result.issue.status).toBe("in_progress");
+    expect(result.issue.assigneeAgentId).toBe(fixture.targetAgentId);
+  });
+
   it("rolls back every mutation when the in-transaction audit insert fails", async () => {
     const fixture = await seedDispatchFixture();
     await db.execute(sql`

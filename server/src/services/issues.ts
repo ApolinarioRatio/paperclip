@@ -7180,6 +7180,10 @@ export function issueService(db: Db) {
           trustExplicitResponsibleUserId: trustExplicitResponsibleUserId === true,
         });
 
+        // PostgreSQL's defaultNow() has microsecond precision; the governed-dispatch
+        // CAS WHERE clause sends a JS Date (ms only), so it would compare .123 against
+        // the stored .123456 and find no match. Caller-supplied timestamps are preserved.
+        const creationTimestamp = new Date();
         const values = {
           ...issueData,
           responsibleUserId,
@@ -7198,6 +7202,8 @@ export function issueService(db: Db) {
           companyId,
           issueNumber,
           identifier,
+          createdAt: issueData.createdAt ?? creationTimestamp,
+          updatedAt: issueData.updatedAt ?? creationTimestamp,
         } as typeof issues.$inferInsert;
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
