@@ -84,7 +84,7 @@ describe("GET /health", () => {
     const res = await request(app).get("/health/runtime-build");
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
-      runtimeBuildId: "rata2110-governed-queue-v3",
+      runtimeBuildId: "rata2110-governed-queue-v4",
       baseCommit: "213dabab4f8e1f3bb1803a2924c0fea1289fcd4c",
     });
   });
