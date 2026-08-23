@@ -319,6 +319,26 @@ describe("AgentConfigForm environment selector", () => {
     expect(result.container.querySelector("select")).toBeNull();
   });
 
+  it("renders the optional live-run admission cap in advanced run policy", async () => {
+    const result = await renderForm([
+      makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+    ], {
+      runtimeConfig: { heartbeat: { maxLiveRuns: 2 } },
+    });
+    roots.push(result.root);
+
+    const advancedPolicyToggle = Array.from(result.container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Advanced Run Policy"));
+    expect(advancedPolicyToggle).toBeTruthy();
+    await act(() => {
+      advancedPolicyToggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(result.container.textContent).toContain("Max live runs");
+    expect(result.container.querySelector("input[value=\"2\"]")).not.toBeNull();
+  });
+
   it("shows concise Environment copy when one runnable non-local environment exists", async () => {
     const result = await renderForm([
       makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),

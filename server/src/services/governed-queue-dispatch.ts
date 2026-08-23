@@ -26,6 +26,7 @@ import {
   resolveGovernedVerifierPool,
 } from "./governed-issue-separation.js";
 import { issueTreeControlService } from "./issue-tree-control.js";
+import { admitLiveRun } from "./live-run-admission.js";
 
 const LIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution", "claimed"] as const;
 const LIVE_RUN_STATUSES = ["queued", "running"] as const;
@@ -56,6 +57,10 @@ function readObject(value: unknown): Record<string, unknown> {
 
 function readNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function mergeGovernedDispatchContext(existing: unknown, incoming: Record<string, unknown>) {
+  return { ...readObject(existing), ...incoming };
 }
 
 function normalizedMarkerDescription(description: string | null, approvalMarker: string) {
@@ -267,6 +272,14 @@ export function governedQueueDispatchService(db: Db) {
       const serverIdempotencyKey = `governed_queue:${input.authorityAgentId}:${callerIdempotencyKey}`;
       const publications: ActivityPublication[] = [];
       const result = await db.transaction(async (tx) => {
+        const issue = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!issue) throw conflict("Issue does not belong to company", { code: "issue_company_mismatch" });
+
         const company = await tx
           .select({ id: companies.id, status: companies.status })
           .from(companies)
@@ -371,13 +384,6 @@ export function governedQueueDispatchService(db: Db) {
           excludeIssueId: input.issueId,
         });
 
-        const issue = await tx
-          .select()
-          .from(issues)
-          .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
-          .for("update")
-          .then((rows) => rows[0] ?? null);
-        if (!issue) throw conflict("Issue does not belong to company", { code: "issue_company_mismatch" });
         await assertIssueCreatedAfterGovernedCutover(tx as unknown as Db, issue);
         if (issue.updatedAt.getTime() !== expectedUpdatedAt.getTime()) {
           throw preconditionFailed("Issue version no longer matches", { code: "stale_issue_version" });
@@ -571,6 +577,60 @@ export function governedQueueDispatchService(db: Db) {
           });
         }
 
+        const payload = {
+          issueId: input.issueId,
+          taskId: input.issueId,
+          approvalId: input.approvalId,
+          approvalMarker,
+          expectedUpdatedAt: expectedUpdatedAt.toISOString(),
+          authorityAgentId: input.authorityAgentId,
+          targetAgentId: input.targetAgentId,
+          scopeDigest,
+          policyDigest: verifierPool.policyDigest,
+          reviewRequired: true,
+          expiresAt: expiresAt.toISOString(),
+          maxDispatches: input.maxDispatches,
+        };
+        const admission = await admitLiveRun({
+          tx,
+          agent: target,
+          wakeupRequest: {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "governed_queue_dispatch",
+            payload,
+            requestedByActorType: "agent",
+            requestedByActorId: input.authorityAgentId,
+            idempotencyKey: serverIdempotencyKey,
+          },
+          run: {
+            invocationSource: "automation",
+            triggerDetail: "system",
+            responsibleUserId,
+            contextSnapshot: {
+              ...payload,
+              wakeReason: "governed_queue_dispatch",
+              taskKey: `issue:${input.issueId}`,
+            },
+            sessionIdBefore: input.sessionIdBefore,
+          },
+          coalescing: {
+            taskKey: `issue:${input.issueId}`,
+            mergeContextSnapshot: mergeGovernedDispatchContext,
+          },
+          now,
+        });
+        if (admission.kind === "skipped") {
+          throw conflict("Target agent live-run capacity is full", {
+            code: "heartbeat_live_run_limit",
+            observed: admission.observed,
+            limit: admission.limit,
+            scope: "target_agent",
+          });
+        }
+        const run = admission.run;
+        const linkedWakeupRequest = admission.wakeupRequest;
+
         const updatedIssue = await tx
           .update(issues)
           .set({
@@ -626,63 +686,6 @@ export function governedQueueDispatchService(db: Db) {
           });
         }
 
-        const payload = {
-          issueId: input.issueId,
-          taskId: input.issueId,
-          approvalId: input.approvalId,
-          approvalMarker,
-          expectedUpdatedAt: expectedUpdatedAt.toISOString(),
-          authorityAgentId: input.authorityAgentId,
-          targetAgentId: input.targetAgentId,
-          scopeDigest,
-          policyDigest: verifierPool.policyDigest,
-          reviewRequired: true,
-          expiresAt: expiresAt.toISOString(),
-          maxDispatches: input.maxDispatches,
-        };
-        const wakeupRequest = await tx
-          .insert(agentWakeupRequests)
-          .values({
-            companyId: input.companyId,
-            agentId: input.targetAgentId,
-            source: "automation",
-            triggerDetail: "system",
-            reason: "governed_queue_dispatch",
-            payload,
-            status: "queued",
-            requestedByActorType: "agent",
-            requestedByActorId: input.authorityAgentId,
-            idempotencyKey: serverIdempotencyKey,
-            updatedAt: now,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-        const run = await tx
-          .insert(heartbeatRuns)
-          .values({
-            companyId: input.companyId,
-            agentId: input.targetAgentId,
-            invocationSource: "automation",
-            triggerDetail: "system",
-            status: "queued",
-            responsibleUserId,
-            wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: {
-              ...payload,
-              wakeReason: "governed_queue_dispatch",
-              taskKey: `issue:${input.issueId}`,
-            },
-            sessionIdBefore: input.sessionIdBefore,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-        const linkedWakeupRequest = await tx
-          .update(agentWakeupRequests)
-          .set({ runId: run.id, updatedAt: now })
-          .where(eq(agentWakeupRequests.id, wakeupRequest.id))
-          .returning()
-          .then((rows) => rows[0]);
-
         await activateGovernedIssueControl(tx as unknown as Db, {
           companyId: input.companyId,
           issueId: input.issueId,
@@ -716,6 +719,7 @@ export function governedQueueDispatchService(db: Db) {
 
         return {
           idempotent: false as const,
+          admissionKind: admission.kind,
           issue: updatedIssue,
           run,
           wakeupRequest: linkedWakeupRequest,

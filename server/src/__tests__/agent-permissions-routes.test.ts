@@ -522,6 +522,24 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(403);
   });
 
+  it("rejects a non-positive heartbeat live-run admission cap", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ runtimeConfig: { heartbeat: { maxLiveRuns: 0 } } }));
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("runtimeConfig.heartbeat.maxLiveRuns must be a positive integer");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
   it("blocks api key creation for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
 
