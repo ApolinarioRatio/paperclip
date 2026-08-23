@@ -1338,6 +1338,14 @@ async function hasGitMetadata(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
+async function isGitCheckout(cwd: string | null | undefined) {
+  const normalized = readNonEmptyString(cwd);
+  if (!normalized) return false;
+  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized })
+    .then((result) => Boolean(readNonEmptyString(result.stdout)))
+    .catch(() => false);
+}
+
 function sameResolvedPath(left: string | null | undefined, right: string | null | undefined) {
   const leftPath = readNonEmptyString(left);
   const rightPath = readNonEmptyString(right);
@@ -1364,6 +1372,84 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     if (pushUrl) return true;
   }
   return false;
+}
+
+function resolveEffectiveWorkspaceStrategyType(
+  mode: ReturnType<typeof resolveExecutionWorkspaceMode>,
+  config: Record<string, unknown>,
+): string {
+  const workspaceStrategy = parseObject(config.workspaceStrategy);
+  // Default mirrors workspace-runtime.ts realizeExecutionWorkspace: missing type → "project_primary".
+  // agent_default is a metadata-only mode that never creates a worktree, so it keeps "adapter_managed".
+  return (
+    readNonEmptyString(workspaceStrategy.type) ??
+    (mode === "agent_default" ? "adapter_managed" : "project_primary")
+  );
+}
+
+export async function assertGitWorktreeBaseWorkspaceReady(input: {
+  requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
+  config: Record<string, unknown>;
+  issue: {
+    id: string;
+    identifier: string | null;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+    executionWorkspaceId?: string | null;
+    executionWorkspacePreference?: string | null;
+  } | null;
+  base: ExecutionWorkspaceInput;
+}) {
+  if (!input.issue) return;
+  if (
+    input.requestedExecutionWorkspaceMode !== "isolated_workspace" &&
+    input.requestedExecutionWorkspaceMode !== "operator_branch"
+  ) {
+    return;
+  }
+
+  const strategyType = resolveEffectiveWorkspaceStrategyType(
+    input.requestedExecutionWorkspaceMode,
+    input.config,
+  );
+  if (strategyType !== "git_worktree") return;
+
+  const issueLabel = input.issue.identifier ?? input.issue.id;
+  const remediation = "This task needs a project / project workspace or a reusable execution workspace before it can run.";
+  const fail = (reason: string, message: string, extra: Record<string, unknown> = {}) => {
+    throw new WorkspaceValidationFailure(message, {
+      workspaceValidation: {
+        reason,
+        issueId: input.issue!.id,
+        issueIdentifier: input.issue!.identifier,
+        issueProjectId: input.issue!.projectId,
+        issueProjectWorkspaceId: input.issue!.projectWorkspaceId,
+        issueExecutionWorkspaceId: input.issue!.executionWorkspaceId ?? null,
+        issueExecutionWorkspacePreference: input.issue!.executionWorkspacePreference ?? null,
+        requestedExecutionWorkspaceMode: input.requestedExecutionWorkspaceMode,
+        workspaceStrategyType: strategyType,
+        resolvedWorkspaceSource: input.base.source,
+        resolvedProjectId: input.base.projectId,
+        resolvedProjectWorkspaceId: input.base.workspaceId,
+        resolvedWorkspaceCwd: input.base.baseCwd,
+        ...extra,
+      },
+    });
+  };
+
+  if (input.base.source === "agent_home") {
+    fail(
+      "git_worktree_base_agent_home",
+      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but no project or reusable execution workspace was resolved; refusing to create a git worktree from agent fallback cwd "${input.base.baseCwd}". ${remediation}`,
+    );
+  }
+
+  if (!await isGitCheckout(input.base.baseCwd)) {
+    fail(
+      "git_worktree_base_not_git_checkout",
+      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout. ${remediation}`,
+    );
+  }
 }
 
 export async function assertPushCapabilityCheckoutValid(input: {
@@ -2880,6 +2966,9 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T>(input: 
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
   } catch (error) {
+    if (isWorkspaceValidationFailure(error)) {
+      throw error;
+    }
     throw createInheritedExecutionWorkspaceReuseFailure({
       reason: "inherited_workspace_reuse_failed",
       issueRef: input.issueRef,
@@ -4794,6 +4883,26 @@ export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeSe
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  runtimeEnv?: Record<string, string | undefined>;
+}
+
+function isTruthyRuntimeEnvValue(value: string | undefined) {
+  return value === "true" || value === "1" || value === "yes" || value === "on";
+}
+
+export function resolveHeartbeatSchedulingSuppression(
+  env: Record<string, string | undefined> = process.env,
+): { suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | null } {
+  if (isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE)) {
+    return { suppressed: true, reason: "worktree_instance" };
+  }
+  if (
+    isTruthyRuntimeEnvValue(env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS) ||
+    isTruthyRuntimeEnvValue(env.PAPERCLIP_RESTORE_IN_PROGRESS)
+  ) {
+    return { suppressed: true, reason: "database_restore_in_progress" };
+  }
+  return { suppressed: false, reason: null };
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -4801,6 +4910,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
+  const runtimeEnv = options.runtimeEnv ?? process.env;
+  const getSchedulingSuppression = () => resolveHeartbeatSchedulingSuppression(runtimeEnv);
 
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
@@ -9710,6 +9821,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function resumeQueuedRuns() {
+    if (getSchedulingSuppression().suppressed) return;
+
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
@@ -9836,6 +9949,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    if (getSchedulingSuppression().suppressed) return [];
+
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
@@ -9914,6 +10029,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function executeRun(runId: string) {
+    if (getSchedulingSuppression().suppressed) return;
+
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
@@ -10565,17 +10682,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       repoUrl: resolvedWorkspace.repoUrl,
       repoRef: resolvedWorkspace.repoRef,
     } satisfies ExecutionWorkspaceInput;
+    await assertGitWorktreeBaseWorkspaceReady({
+      requestedExecutionWorkspaceMode,
+      config: hostExecutionWorkspaceConfig,
+      issue: issueRef,
+      base: executionWorkspaceBase,
+    });
     const workspaceStrategyForFingerprint = parseObject(hostExecutionWorkspaceConfig.workspaceStrategy);
     const workspaceStrategyFingerprintValue =
       Object.keys(workspaceStrategyForFingerprint).length > 0 ? workspaceStrategyForFingerprint : null;
-    const latestWorkspaceStrategyType =
-      readNonEmptyString(workspaceStrategyForFingerprint.type) ??
-      (requestedExecutionWorkspaceMode === "agent_default"
-        ? "adapter_managed"
-        : requestedExecutionWorkspaceMode === "isolated_workspace" ||
-            requestedExecutionWorkspaceMode === "operator_branch"
-          ? "git_worktree"
-          : "project_primary");
+    const latestWorkspaceStrategyType = resolveEffectiveWorkspaceStrategyType(
+      requestedExecutionWorkspaceMode,
+      hostExecutionWorkspaceConfig,
+    );
     const selectedEnvironmentConfigForFingerprint = parseObject(selectedEnvironmentForConfig?.config);
     const workspaceEnvironmentFingerprint = selectedEnvironmentForConfig
       ? {
@@ -12189,7 +12308,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 await finalizeIssueCommentPolicy(livenessRun, failedAgent).catch(() => undefined);
               }
             }
-            await releaseIssueExecutionAndPromote(livenessRun).catch(() => undefined);
+            await releaseIssueExecutionAndPromote(livenessRun).catch((releaseError) => {
+              logger.error(
+                { err: releaseError, runId },
+                "failed to release issue execution after heartbeat setup failure",
+              );
+            });
           }
           // Ensure the agent is not left stuck in "running" if the setup-failure
           // path owned the terminal transition. If another path already finalized
@@ -13068,6 +13192,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
     };
+
+    const schedulingSuppression = getSchedulingSuppression();
+    if (schedulingSuppression.suppressed) {
+      await writeSkippedHeartbeatRequest("heartbeat.scheduling_suppressed", {
+        reason: schedulingSuppression.reason,
+      });
+      return null;
+    }
 
     const company = await db
       .select({ status: companies.status })
@@ -14549,6 +14681,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     buildRunOutputSilence,
 
     tickTimers: async (now = new Date()) => {
+      if (getSchedulingSuppression().suppressed) {
+        return {
+          checked: 0,
+          enqueued: 0,
+          skipped: 0,
+        };
+      }
+
       const allAgents = await db
         .select({ ...getTableColumns(agents) })
         .from(agents)

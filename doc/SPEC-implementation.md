@@ -83,8 +83,12 @@ V1 implementation extends this baseline into a company-centric, governance-aware
 - Revenue/expense accounting beyond model/token costs
 - Knowledge base subsystem
 - Public marketplace (ClipHub)
-- Multi-board governance or role-based human permission granularity
+- Multi-board governance (multiple board UIs for a single company)
 - Automatic self-healing orchestration (auto-reassign/retry planners)
+
+Role-based human permission granularity is V1 — see the `humans-and-permissions`
+plan, the `principal_permission_grants` table, and the `PERMISSION_KEYS` set
+in `packages/shared/src/constants.ts`.
 
 ## 6. Architecture
 
@@ -355,7 +359,7 @@ Invariants:
 
 Operational policy:
 
-- Config read APIs redact sensitive plain values.
+- Agent API responses, including list, detail, self-detail, create, update, configuration rollback, and lifecycle mutation responses, redact sensitive plain values while preserving non-secret configuration fields.
 - Activity and approval payloads must not persist raw sensitive values.
 - Config revisions may include redacted placeholders; such revisions are non-restorable for redacted fields.
 
