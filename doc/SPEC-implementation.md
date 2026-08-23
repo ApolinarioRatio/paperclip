@@ -355,7 +355,7 @@ Invariants:
 
 Operational policy:
 
-- Config read APIs redact sensitive plain values.
+- Agent API responses, including list, detail, self-detail, create, update, configuration rollback, and lifecycle mutation responses, redact sensitive plain values while preserving non-secret configuration fields.
 - Activity and approval payloads must not persist raw sensitive values.
 - Config revisions may include redacted placeholders; such revisions are non-restorable for redacted fields.
 

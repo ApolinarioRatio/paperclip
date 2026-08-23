@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText, sanitizeRecord } from "../redaction.js";
+import {
+  REDACTED_EVENT_VALUE,
+  redactAgentAdapterConfig,
+  redactEventPayload,
+  redactSensitiveText,
+  restoreRedactedConfigValue,
+  sanitizeRecord,
+} from "../redaction.js";
 
 describe("redaction", () => {
   it("redacts sensitive keys and nested secret values", () => {
@@ -134,5 +141,53 @@ describe("redaction", () => {
 
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
+  });
+
+  it("redacts every plaintext agent env binding while preserving secret references", () => {
+    const result = redactAgentAdapterConfig({
+      headers: { "x-openclaw-token": "header-secret" },
+      devicePrivateKeyPem: "private-key-secret",
+      env: {
+        SAFE_NAME: "legacy-plain-secret",
+        TYPED_NAME: { type: "plain", value: "typed-plain-secret" },
+        SECRET_REFERENCE: { type: "secret_ref", secretId: "secret-id", version: "latest" },
+      },
+    });
+
+    expect(result).toEqual({
+      headers: { "x-openclaw-token": REDACTED_EVENT_VALUE },
+      devicePrivateKeyPem: REDACTED_EVENT_VALUE,
+      env: {
+        SAFE_NAME: { type: "plain", value: REDACTED_EVENT_VALUE },
+        TYPED_NAME: { type: "plain", value: REDACTED_EVENT_VALUE },
+        SECRET_REFERENCE: { type: "secret_ref", secretId: "secret-id", version: "latest" },
+      },
+    });
+  });
+
+  it("restores nested and env redaction placeholders from persisted config", () => {
+    const existing = {
+      headers: { "x-openclaw-token": "header-secret" },
+      devicePrivateKeyPem: "private-key-secret",
+      env: {
+        LEGACY: "legacy-secret",
+        TYPED: { type: "plain", value: "typed-secret" },
+      },
+      safeOption: "before",
+    };
+    const requested = {
+      headers: { "x-openclaw-token": REDACTED_EVENT_VALUE },
+      devicePrivateKeyPem: REDACTED_EVENT_VALUE,
+      env: {
+        LEGACY: { type: "plain", value: REDACTED_EVENT_VALUE },
+        TYPED: { type: "plain", value: REDACTED_EVENT_VALUE },
+      },
+      safeOption: "after",
+    };
+
+    expect(restoreRedactedConfigValue(requested, existing)).toEqual({
+      ...existing,
+      safeOption: "after",
+    });
   });
 });

@@ -133,6 +133,49 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   return sanitizeRecord(payload);
 }
 
+function redactAgentEnvBinding(value: unknown): unknown {
+  if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) return sanitizeValue(value);
+  if (isPlainBinding(value)) return { type: "plain", value: REDACTED_EVENT_VALUE };
+  if (typeof value === "string") return { type: "plain", value: REDACTED_EVENT_VALUE };
+  if (value === null || value === undefined) return value;
+  return REDACTED_EVENT_VALUE;
+}
+
+export function redactAgentAdapterConfig(
+  adapterConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  const env = isPlainObject(adapterConfig.env)
+    ? Object.fromEntries(
+        Object.entries(adapterConfig.env).map(([key, value]) => [key, redactAgentEnvBinding(value)]),
+      )
+    : adapterConfig.env;
+
+  return redactEventPayload({ ...adapterConfig, env }) ?? {};
+}
+
+export function restoreRedactedConfigValue(requested: unknown, existing: unknown): unknown {
+  if (requested === REDACTED_EVENT_VALUE) {
+    return existing === undefined ? requested : existing;
+  }
+  if (isPlainBinding(requested) && requested.value === REDACTED_EVENT_VALUE) {
+    return existing === undefined ? requested : existing;
+  }
+  if (Array.isArray(requested)) {
+    const existingItems = Array.isArray(existing) ? existing : [];
+    return requested.map((value, index) => restoreRedactedConfigValue(value, existingItems[index]));
+  }
+  if (isPlainObject(requested)) {
+    const existingRecord = isPlainObject(existing) ? existing : {};
+    return Object.fromEntries(
+      Object.entries(requested).map(([key, value]) => [
+        key,
+        restoreRedactedConfigValue(value, existingRecord[key]),
+      ]),
+    );
+  }
+  return requested;
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
