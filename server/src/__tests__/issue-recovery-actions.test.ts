@@ -331,6 +331,148 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("wakes the board operator once when recovery-owner retries park at board escalation", async () => {
+    const { companyId, sourceIssue } = await seedCompany();
+    const mannyId = randomUUID();
+    await db.insert(agents).values({
+      id: mannyId,
+      companyId,
+      name: "Manny",
+      role: "ops",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId: sourceIssue.id,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: null,
+      previousOwnerAgentId: sourceIssue.assigneeAgentId,
+      returnOwnerAgentId: sourceIssue.assigneeAgentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "recovery:missing-owner",
+      evidence: { sourceIssueId: sourceIssue.id },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: {
+        type: "bounded_recovery_owner",
+        attempt: 1,
+        maxAttempts: 3,
+      },
+    });
+    const enqueuedRunId = randomUUID();
+    const enqueueWakeup = vi.fn(async () => {
+      await db.insert(heartbeatRuns).values({
+        id: enqueuedRunId,
+        companyId,
+        agentId: mannyId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {
+          issueId: sourceIssue.id,
+          recoveryActionId: action.id,
+          boardOperatorRecoveryWakeKey: `board_operator_recovery:${action.id}:recovery_owner_missing`,
+        },
+      });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, enqueuedRunId));
+      return run ?? null;
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const first = await recovery.reconcileStrandedAssignedIssues();
+    const second = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(first.escalated).toBe(1);
+    expect(second.skipped).toBeGreaterThanOrEqual(1);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      mannyId,
+      expect.objectContaining({
+        reason: "board_operator_recovery_action",
+        idempotencyKey: `board_operator_recovery:${action.id}:recovery_owner_missing`,
+        payload: expect.objectContaining({
+          issueId: sourceIssue.id,
+          recoveryActionId: action.id,
+          boardOperatorRecoveryReason: "recovery_owner_missing",
+        }),
+      }),
+    );
+
+    const [updatedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(updatedAction).toMatchObject({
+      status: "escalated",
+      ownerType: "board",
+      ownerAgentId: null,
+      wakePolicy: expect.objectContaining({
+        type: "board_escalation",
+        boardOperatorWake: expect.objectContaining({
+          status: "emitted",
+          agentId: mannyId,
+          runId: enqueuedRunId,
+          idempotencyKey: `board_operator_recovery:${action.id}:recovery_owner_missing`,
+        }),
+      }),
+    });
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, action.id));
+    expect(activityRows.map((row) => row.action)).toContain("issue.board_operator_recovery_wake_emitted");
+  });
+
+  it("records a failed board-operator wake instead of silently parking recovery", async () => {
+    const { companyId, sourceIssue } = await seedCompany();
+    const mannyId = randomUUID();
+    await db.insert(agents).values({
+      id: mannyId,
+      companyId,
+      name: "Manny",
+      role: "ops",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId: sourceIssue.id,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: null,
+      previousOwnerAgentId: sourceIssue.assigneeAgentId,
+      returnOwnerAgentId: sourceIssue.assigneeAgentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "recovery:wake-fails",
+      evidence: { sourceIssueId: sourceIssue.id },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: {
+        type: "bounded_recovery_owner",
+        attempt: 1,
+        maxAttempts: 3,
+      },
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    await expect(recovery.reconcileStrandedAssignedIssues()).rejects.toThrow(
+      "Board-operator recovery wake returned no run",
+    );
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, action.id));
+    expect(activityRows.map((row) => row.action)).toContain("issue.board_operator_recovery_wake_failed");
+  });
+
   it.each([
     ["process_lost", undefined, "coder"],
     ["adapter_failed", "successful_run_missing_state", "coder"],

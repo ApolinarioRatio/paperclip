@@ -682,6 +682,11 @@ On server startup:
 3. Set affected non-paused/non-terminated agents to `error` (or `idle` based on policy).
 4. Emit recovery events to websocket and activity log.
 
+When bounded recovery retries park an issue at board escalation, the recovery
+service must also enqueue one idempotent board-operator wake for an invokable
+operator agent and record the wake result in `activity_log`. A failed operator
+wake is a visible recovery failure, not a silent parked chain.
+
 ## 13. API Surface Changes
 
 ## 13.1 New/updated endpoints

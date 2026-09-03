@@ -2618,6 +2618,247 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       : null;
   }
 
+  function normalizeRecoveryAgentKey(value: string | null | undefined) {
+    return (value ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  }
+
+  async function resolveBoardOperatorRecoveryAgentId(companyId: string, issue: typeof issues.$inferSelect) {
+    const candidates = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.companyId, companyId))
+      .orderBy(
+        sql`case
+          when lower(${agents.name}) = 'manny' then 0
+          when lower(${agents.name}) = 'herman' then 1
+          when lower(${agents.role}) in ('ops', 'operator', 'cto', 'ceo') then 2
+          else 3
+        end`,
+        asc(agents.createdAt),
+      );
+
+    for (const candidate of candidates) {
+      const key = normalizeRecoveryAgentKey(candidate.name);
+      if (
+        key !== "manny" &&
+        key !== "herman" &&
+        candidate.role !== "ops" &&
+        candidate.role !== "operator" &&
+        candidate.role !== "cto" &&
+        candidate.role !== "ceo"
+      ) {
+        continue;
+      }
+      const budgetBlock = await budgets.getInvocationBlock(companyId, candidate.id, {
+        issueId: issue.id,
+        projectId: issue.projectId,
+      });
+      if (
+        (await isAgentInvokable(candidate)) &&
+        isHeartbeatWakeOnDemandEnabled(candidate) &&
+        !budgetBlock
+      ) {
+        return candidate.id;
+      }
+    }
+
+    return null;
+  }
+
+  async function hasBoardOperatorRecoveryWake(input: {
+    action: typeof issueRecoveryActions.$inferSelect;
+    agentId: string;
+    idempotencyKey: string;
+  }) {
+    const wakePolicy = parseObject(input.action.wakePolicy);
+    const boardOperatorWake = parseObject(wakePolicy.boardOperatorWake);
+    if (
+      readNonEmptyString(boardOperatorWake.idempotencyKey) === input.idempotencyKey &&
+      readNonEmptyString(boardOperatorWake.status) === "emitted"
+    ) {
+      return true;
+    }
+
+    const [wake, run] = await Promise.all([
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, input.action.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+          sql`${agentWakeupRequests.status} <> 'skipped'`,
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, input.action.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'boardOperatorRecoveryWakeKey' = ${input.idempotencyKey}`,
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES, ...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+    return Boolean(wake || run);
+  }
+
+  async function emitBoardOperatorRecoveryWake(input: {
+    action: typeof issueRecoveryActions.$inferSelect;
+    issue: typeof issues.$inferSelect;
+    reason: string;
+  }) {
+    const operatorAgentId = await resolveBoardOperatorRecoveryAgentId(input.action.companyId, input.issue);
+    if (!operatorAgentId) {
+      await logActivity(db, {
+        companyId: input.action.companyId,
+        actorType: "system",
+        actorId: "recovery",
+        agentId: null,
+        runId: null,
+        action: "issue.board_operator_recovery_wake_unavailable",
+        entityType: "issue_recovery_action",
+        entityId: input.action.id,
+        details: {
+          sourceIssueId: input.issue.id,
+          reason: input.reason,
+          recoveryActionId: input.action.id,
+        },
+      });
+      return null;
+    }
+
+    const idempotencyKey = `board_operator_recovery:${input.action.id}:${input.reason}`;
+    if (await hasBoardOperatorRecoveryWake({
+      action: input.action,
+      agentId: operatorAgentId,
+      idempotencyKey,
+    })) {
+      return null;
+    }
+
+    try {
+      const wake = await deps.enqueueWakeup(operatorAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "board_operator_recovery_action",
+        idempotencyKey,
+        payload: withRecoveryModelProfileHint({
+          issueId: input.issue.id,
+          sourceIssueId: input.issue.id,
+          recoveryActionId: input.action.id,
+          recoveryCause: input.action.cause,
+          boardOperatorRecoveryWakeKey: idempotencyKey,
+          boardOperatorRecoveryReason: input.reason,
+        }, "status_only"),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: input.issue.id,
+          taskId: input.issue.id,
+          wakeReason: "board_operator_recovery_action",
+          source: "issue_recovery_action.board_operator_escalation",
+          recoveryActionId: input.action.id,
+          sourceIssueId: input.issue.id,
+          recoveryCause: input.action.cause,
+          boardOperatorRecoveryWakeKey: idempotencyKey,
+          boardOperatorRecoveryReason: input.reason,
+          skipIssueComment: true,
+        }, "status_only"),
+      });
+      if (!wake) {
+        await logActivity(db, {
+          companyId: input.action.companyId,
+          actorType: "system",
+          actorId: "recovery",
+          agentId: operatorAgentId,
+          runId: null,
+          action: "issue.board_operator_recovery_wake_failed",
+          entityType: "issue_recovery_action",
+          entityId: input.action.id,
+          issueId: input.issue.id,
+          details: {
+            sourceIssueId: input.issue.id,
+            reason: input.reason,
+            recoveryActionId: input.action.id,
+            boardOperatorAgentId: operatorAgentId,
+            idempotencyKey,
+            error: "enqueue_wakeup_returned_null",
+          },
+        });
+        throw new Error("Board-operator recovery wake returned no run");
+      }
+      const wakePolicy = parseObject(input.action.wakePolicy);
+      await db
+        .update(issueRecoveryActions)
+        .set({
+          wakePolicy: {
+            ...wakePolicy,
+            boardOperatorWake: {
+              status: "emitted",
+              agentId: operatorAgentId,
+              runId: wake.id,
+              idempotencyKey,
+              emittedAt: new Date().toISOString(),
+            },
+          },
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(issueRecoveryActions.id, input.action.id),
+          eq(issueRecoveryActions.companyId, input.action.companyId),
+        ));
+      await logActivity(db, {
+        companyId: input.action.companyId,
+        actorType: "system",
+        actorId: "recovery",
+        agentId: operatorAgentId,
+        runId: wake?.id ?? null,
+        action: "issue.board_operator_recovery_wake_emitted",
+        entityType: "issue_recovery_action",
+        entityId: input.action.id,
+        issueId: input.issue.id,
+        details: {
+          sourceIssueId: input.issue.id,
+          reason: input.reason,
+          recoveryActionId: input.action.id,
+          boardOperatorAgentId: operatorAgentId,
+          wakeupRunId: wake?.id ?? null,
+          idempotencyKey,
+        },
+      });
+      return wake;
+    } catch (err) {
+      await logActivity(db, {
+        companyId: input.action.companyId,
+        actorType: "system",
+        actorId: "recovery",
+        agentId: operatorAgentId,
+        runId: null,
+        action: "issue.board_operator_recovery_wake_failed",
+        entityType: "issue_recovery_action",
+        entityId: input.action.id,
+        issueId: input.issue.id,
+        details: {
+          sourceIssueId: input.issue.id,
+          reason: input.reason,
+          recoveryActionId: input.action.id,
+          boardOperatorAgentId: operatorAgentId,
+          idempotencyKey,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+      throw err;
+    }
+  }
+
   async function resolveStrandedRecoveryRouting(input: {
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
@@ -3928,6 +4169,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         sourceAssigneePreserved: true,
       },
     });
+    await emitBoardOperatorRecoveryWake({
+      action: updated,
+      issue: input.issue,
+      reason: input.reason,
+    });
     return true;
   }
 
@@ -4230,6 +4476,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issue: input.issue,
         attempt: 1,
         retryOfRunId: input.latestRun?.id ?? null,
+      });
+    } else if (escalatedAction) {
+      await emitBoardOperatorRecoveryWake({
+        action: escalatedAction,
+        issue: input.issue,
+        reason: input.terminalReason,
       });
     }
     return updated;
