@@ -423,4 +423,39 @@ describe("agent routes adapter validation", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(String(res.body.error ?? res.body.message ?? "")).toContain(`Unknown adapter type: ${missingAdapterType}`);
   });
+
+  it.each([0, -1, 1.5, "2"])(
+    "rejects invalid heartbeat maxLiveRuns value %p",
+    async (maxLiveRuns) => {
+      const app = await createApp();
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl)
+          .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+          .send({ runtimeConfig: { heartbeat: { maxLiveRuns } } }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(String(res.body.error ?? res.body.message ?? "")).toContain(
+        "runtimeConfig.heartbeat.maxLiveRuns must be a positive integer",
+      );
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts a positive heartbeat maxLiveRuns value", async () => {
+    const app = await createApp();
+    const runtimeConfig = { heartbeat: { maxLiveRuns: 2 } };
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ runtimeConfig }),
+      expect.anything(),
+    );
+  });
 });

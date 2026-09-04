@@ -80,6 +80,10 @@ import {
 // git-credentials module became its canonical home; existing importers keep working.
 export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
+import {
+  admitLiveRun,
+  promoteScheduledRetryWithAdmission,
+} from "./live-run-admission.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
@@ -9839,53 +9843,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null);
       if (!issue) return null;
 
-      const wakeupRequest = await tx
-        .insert(agentWakeupRequests)
-        .values({
-          companyId: run.companyId,
-          agentId: run.agentId,
+      const admission = await admitLiveRun({
+        tx,
+        agent,
+        wakeupRequest: {
           source: "automation",
           triggerDetail: "system",
           reason: "missing_issue_comment",
-          payload: withRecoveryModelProfileHint({
-            issueId,
-            retryOfRunId: run.id,
-            retryReason: "missing_issue_comment",
-          }, "status_only"),
-          status: "queued",
+          payload: withRecoveryModelProfileHint({ issueId, retryOfRunId: run.id, retryReason: "missing_issue_comment" }, "status_only"),
           requestedByActorType: "system",
           requestedByActorId: null,
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      const queuedRun = await tx
-        .insert(heartbeatRuns)
-        .values({
-          companyId: run.companyId,
-          agentId: run.agentId,
+        },
+        run: {
           invocationSource: "automation",
           triggerDetail: "system",
-          status: "queued",
-          wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
           issueCommentStatus: "not_applicable",
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      await tx
-        .update(agentWakeupRequests)
-        .set({
-          runId: queuedRun.id,
-          updatedAt: now,
-        })
-        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+        },
+        coalescing: { taskKey, excludeRunIds: [run.id], mergeContextSnapshot: mergeCoalescedContextSnapshot },
+        now,
+      });
+      if (admission.kind === "skipped") return null;
+      const queuedRun = admission.run;
 
       await tx
         .update(issues)
@@ -9906,24 +9888,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
 
-      return queuedRun;
+      return { run: queuedRun, admissionKind: admission.kind };
     });
 
     if (!retryRun) return null;
 
-    publishLiveEvent({
-      companyId: retryRun.companyId,
-      type: "heartbeat.run.queued",
-      payload: {
-        runId: retryRun.id,
-        agentId: retryRun.agentId,
-        invocationSource: retryRun.invocationSource,
-        triggerDetail: retryRun.triggerDetail,
-        wakeupRequestId: retryRun.wakeupRequestId,
-      },
-    });
+    if (retryRun.admissionKind === "queued") {
+      publishLiveEvent({
+        companyId: retryRun.run.companyId,
+        type: "heartbeat.run.queued",
+        payload: {
+          runId: retryRun.run.id,
+          agentId: retryRun.run.agentId,
+          invocationSource: retryRun.run.invocationSource,
+          triggerDetail: retryRun.run.triggerDetail,
+          wakeupRequestId: retryRun.run.wakeupRequestId,
+        },
+      });
+    }
 
-    return retryRun;
+    return retryRun.run;
   }
 
   async function hasDeferredIssueCommentWake(companyId: string, issueId: string, agentId: string) {
@@ -10090,52 +10074,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
     const queued = await db.transaction(async (tx) => {
-      const wakeupRequest = await tx
-        .insert(agentWakeupRequests)
-        .values({
-          companyId: run.companyId,
-          agentId: run.agentId,
+      if (issueId) {
+        await tx.execute(
+          sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
+        );
+      }
+      const admission = await admitLiveRun({
+        tx,
+        agent,
+        wakeupRequest: {
           source: "automation",
           triggerDetail: "system",
           reason: "process_lost_retry",
-          payload: withRecoveryModelProfileHint({
-            ...(issueId ? { issueId } : {}),
-            retryOfRunId: run.id,
-          }, "normal_model"),
-          status: "queued",
+          payload: withRecoveryModelProfileHint({ ...(issueId ? { issueId } : {}), retryOfRunId: run.id }, "normal_model"),
           requestedByActorType: "system",
           requestedByActorId: null,
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      const retryRun = await tx
-        .insert(heartbeatRuns)
-        .values({
-          companyId: run.companyId,
-          agentId: run.agentId,
+        },
+        run: {
           invocationSource: "automation",
           triggerDetail: "system",
-          status: "queued",
-          wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
           processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      await tx
-        .update(agentWakeupRequests)
-        .set({
-          runId: retryRun.id,
-          updatedAt: now,
-        })
-        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+        },
+        coalescing: { taskKey, excludeRunIds: [run.id], mergeContextSnapshot: mergeCoalescedContextSnapshot },
+        now,
+      });
+      if (admission.kind === "skipped") return null;
+      const retryRun = admission.run;
 
       if (issueId) {
         await tx
@@ -10150,22 +10118,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
       }
 
-      return retryRun;
+      return { run: retryRun, admissionKind: admission.kind };
     });
 
-    publishLiveEvent({
-      companyId: queued.companyId,
-      type: "heartbeat.run.queued",
-      payload: {
-        runId: queued.id,
-        agentId: queued.agentId,
-        invocationSource: queued.invocationSource,
-        triggerDetail: queued.triggerDetail,
-        wakeupRequestId: queued.wakeupRequestId,
-      },
-    });
+    if (!queued) return null;
 
-    await appendRunEvent(queued, 1, {
+    if (queued.admissionKind === "queued") {
+      publishLiveEvent({
+        companyId: queued.run.companyId,
+        type: "heartbeat.run.queued",
+        payload: {
+          runId: queued.run.id,
+          agentId: queued.run.agentId,
+          invocationSource: queued.run.invocationSource,
+          triggerDetail: queued.run.triggerDetail,
+          wakeupRequestId: queued.run.wakeupRequestId,
+        },
+      });
+    }
+
+    await appendRunEvent(queued.run, 1, {
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
@@ -10175,7 +10147,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    return queued;
+    return queued.run;
   }
 
   function toHotRestartIntentRun(input: {
@@ -11007,22 +10979,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    const promoted = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "queued",
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.id, dueRun.id),
-          eq(heartbeatRuns.status, "scheduled_retry"),
-          lte(heartbeatRuns.scheduledRetryAt, now),
-        ),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!promoted) return { outcome: "not_promoted", run: null };
+    const admission = await db.transaction((tx) => promoteScheduledRetryWithAdmission({
+      tx,
+      agent,
+      runId: dueRun.id,
+      now,
+    }));
+    if (admission.kind === "at_capacity") {
+      return { outcome: "not_promoted", run: admission.run };
+    }
+    if (admission.kind !== "promoted") return { outcome: "not_promoted", run: null };
+    const promoted = admission.run;
 
     await appendRunEvent(promoted, await nextRunEventSeq(promoted.id), {
       eventType: "lifecycle",
@@ -12128,6 +12095,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+      maxLiveRuns: normalizeOptionalPositiveInteger(heartbeat.maxLiveRuns),
       skipTimerWhenNoActionableWork: asBoolean(
         heartbeat.skipTimerWhenNoActionableWork ??
           heartbeat.requireActionableTimerWork ??
@@ -12150,6 +12118,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (value === null || value === undefined || value === "") return null;
     const normalized = Math.floor(asNumber(value, 0));
     return normalized >= 0 ? normalized : null;
+  }
+
+  function normalizeOptionalPositiveInteger(value: unknown) {
+    if (value === null || value === undefined || value === "") return null;
+    const normalized = Math.floor(asNumber(value, 0));
+    return normalized > 0 ? normalized : null;
   }
 
   function currentUtcDayWindow(now = new Date()) {
@@ -16519,7 +16493,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             ),
           )
-          .orderBy(asc(agentWakeupRequests.requestedAt))
+          .orderBy(
+            asc(agentWakeupRequests.agentId),
+            asc(agentWakeupRequests.requestedAt),
+            asc(agentWakeupRequests.id),
+          )
           .limit(1)
           .then((rows) => rows[0] ?? null);
 
@@ -16632,45 +16610,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             deferredWakeReason === "issue_reopened_via_comment"
           );
         let reopenedActivity: LogActivityInput | null = null;
-
-        if (shouldReopenDeferredCommentWake) {
-          const reopenedFromStatus = issue.status;
-          const reopenedIssue = await issuesSvc.update(
-            issue.id,
-            {
-              status: "todo",
-              executionState: null,
-            },
-            tx,
-          );
-          if (reopenedIssue) {
-            issue = {
-              ...issue,
-              identifier: reopenedIssue.identifier,
-              status: reopenedIssue.status,
-              executionRunId: reopenedIssue.executionRunId,
-            };
-            if (!readNonEmptyString(promotedContextSeed.reopenedFrom)) {
-              promotedContextSeed.reopenedFrom = reopenedFromStatus;
-            }
-            reopenedActivity = {
-              companyId: issue.companyId,
-              actorType: "system",
-              actorId: "heartbeat",
-              agentId: deferred.agentId,
-              runId: run.id,
-              action: "issue.updated",
-              entityType: "issue",
-              entityId: issue.id,
-              details: {
-                status: "todo",
-                reopened: true,
-                reopenedFrom: reopenedFromStatus,
-                source: "deferred_comment_wake",
-                identifier: issue.identifier,
-              },
-            };
-          }
+        const reopenedFromStatus = shouldReopenDeferredCommentWake ? issue.status : null;
+        if (reopenedFromStatus && !readNonEmptyString(promotedContextSeed.reopenedFrom)) {
+          promotedContextSeed.reopenedFrom = reopenedFromStatus;
         }
 
         const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
@@ -16720,35 +16662,71 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         }
         const now = new Date();
-        const newRun = await tx
-          .insert(heartbeatRuns)
-          .values({
-            companyId: deferredAgent.companyId,
-            agentId: deferredAgent.id,
+        const admission = await admitLiveRun({
+          tx,
+          agent: deferredAgent,
+          existingWakeupRequestId: deferred.id,
+          preserveExistingWakeAtCapacity: true,
+          wakeupRequest: {
+            source: promotedSource,
+            triggerDetail: promotedTriggerDetail,
+            reason: "issue_execution_promoted",
+            payload: promotedPayload,
+            requestedByActorType: deferred.requestedByActorType,
+            requestedByActorId: deferred.requestedByActorId,
+            idempotencyKey: deferred.idempotencyKey,
+          },
+          run: {
             invocationSource: promotedSource,
             triggerDetail: promotedTriggerDetail,
-            status: "queued",
-            wakeupRequestId: deferred.id,
             contextSnapshot: promotedContextSnapshot,
             responsibleUserId: promotedResponsibleUserId,
             sessionIdBefore: sessionBefore,
             continuationAttempt: promotedContinuationAttempt,
-          })
-          .returning()
-          .then((rows) => rows[0]);
+          },
+          coalescing: {
+            taskKey: promotedTaskKey,
+            excludeRunIds: [run.id],
+            mergeContextSnapshot: mergeCoalescedContextSnapshot,
+          },
+          now,
+        });
+        if (admission.kind === "deferred_at_capacity") break;
+        if (admission.kind === "skipped") continue;
+        const newRun = admission.run;
 
-        await tx
-          .update(agentWakeupRequests)
-          .set({
-            status: "queued",
-            reason: "issue_execution_promoted",
-            runId: newRun.id,
-            claimedAt: null,
-            finishedAt: null,
-            error: null,
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, deferred.id));
+        if (reopenedFromStatus) {
+          const reopenedIssue = await issuesSvc.update(
+            issue.id,
+            { status: "todo", executionState: null },
+            tx,
+          );
+          if (reopenedIssue) {
+            issue = {
+              ...issue,
+              identifier: reopenedIssue.identifier,
+              status: reopenedIssue.status,
+              executionRunId: reopenedIssue.executionRunId,
+            };
+            reopenedActivity = {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "heartbeat",
+              agentId: deferred.agentId,
+              runId: run.id,
+              action: "issue.updated",
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                status: "todo",
+                reopened: true,
+                reopenedFrom: reopenedFromStatus,
+                source: "deferred_comment_wake",
+                identifier: issue.identifier,
+              },
+            };
+          }
+        }
 
         await tx
           .update(issues)
@@ -16762,7 +16740,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(and(eq(issues.id, issue.id), eq(issues.assigneeAgentId, deferredAgent.id)));
 
         return {
-          kind: "promoted" as const,
+          kind: admission.kind === "coalesced" ? "coalesced" as const : "promoted" as const,
           run: newRun,
           reopenedActivity,
         };
@@ -16851,39 +16829,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         const now = new Date();
-        const wakeupRequest = await tx
-          .insert(agentWakeupRequests)
-          .values({
-            companyId: issue.companyId,
-            agentId: recoveryAgent.id,
-            source: "automation",
-            triggerDetail: "system",
-            reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
-            payload: withRecoveryModelProfileHint({
-              issueId: issue.id,
-              retryOfRunId: run.id,
-              retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
-              currentStageId: executionState?.currentStageId ?? null,
-              currentStageType: executionState?.currentStageType ?? null,
-            }, "normal_model"),
-            status: "queued",
-            requestedByActorType: "system",
-            requestedByActorId: null,
-            updatedAt: now,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-
-        const queuedRun = await tx
-          .insert(heartbeatRuns)
-          .values({
-            companyId: issue.companyId,
-            agentId: recoveryAgent.id,
-            invocationSource: "automation",
-            triggerDetail: "system",
-            status: "queued",
-            wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: withRecoveryModelProfileHint({
+        const reviewRecoveryContext = withRecoveryModelProfileHint({
               issueId: issue.id,
               taskId: issue.id,
               wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
@@ -16894,21 +16840,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               currentStageType: executionState?.currentStageType ?? null,
               reviewRecoveryInstruction:
                 "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+            }, "normal_model");
+        const admission = await admitLiveRun({
+          tx,
+          agent: recoveryAgent,
+          wakeupRequest: {
+            source: "automation",
+            triggerDetail: "system",
+            reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
+            payload: withRecoveryModelProfileHint({
+              issueId: issue.id,
+              retryOfRunId: run.id,
+              retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+              currentStageId: executionState?.currentStageId ?? null,
+              currentStageType: executionState?.currentStageType ?? null,
             }, "normal_model"),
+            requestedByActorType: "system",
+            requestedByActorId: null,
+          },
+          run: {
+            invocationSource: "automation",
+            triggerDetail: "system",
+            contextSnapshot: reviewRecoveryContext,
             sessionIdBefore: recoverySessionBefore,
             retryOfRunId: run.id,
-            updatedAt: now,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-
-        await tx
-          .update(agentWakeupRequests)
-          .set({
-            runId: queuedRun.id,
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+          },
+          coalescing: {
+            taskKey: issue.id,
+            excludeRunIds: [run.id],
+            mergeContextSnapshot: mergeCoalescedContextSnapshot,
+          },
+          now,
+        });
+        if (admission.kind === "skipped") return { kind: "released" as const };
+        const queuedRun = admission.run;
 
         await tx
           .update(issues)
@@ -16921,7 +16886,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(eq(issues.id, issue.id));
 
         return {
-          kind: "queued_recovery" as const,
+          kind: admission.kind === "coalesced" ? "coalesced_recovery" as const : "queued_recovery" as const,
           run: queuedRun,
         };
       }
@@ -17019,11 +16984,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           wakeReason: recoveryReason,
         });
       }
-      const wakeupRequest = await tx
-        .insert(agentWakeupRequests)
-        .values({
-          companyId: issue.companyId,
-          agentId: recoveryAgent.id,
+      const admission = await admitLiveRun({
+        tx,
+        agent: recoveryAgent,
+        wakeupRequest: {
           source: "automation",
           triggerDetail: "system",
           reason: recoveryReason,
@@ -17031,39 +16995,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId: issue.id,
             retryOfRunId: run.id,
           }, "normal_model"),
-          status: "queued",
           requestedByActorType: "system",
           requestedByActorId: null,
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      const queuedRun = await tx
-        .insert(heartbeatRuns)
-        .values({
-          companyId: issue.companyId,
-          agentId: recoveryAgent.id,
+        },
+        run: {
           invocationSource: "automation",
           triggerDetail: "system",
-          status: "queued",
-          wakeupRequestId: wakeupRequest.id,
           contextSnapshot: recoveryContextSnapshot,
           responsibleUserId,
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,
-          updatedAt: now,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      await tx
-        .update(agentWakeupRequests)
-        .set({
-          runId: queuedRun.id,
-          updatedAt: now,
-        })
-        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+        },
+        coalescing: {
+          taskKey: issue.id,
+          excludeRunIds: [run.id],
+          mergeContextSnapshot: mergeCoalescedContextSnapshot,
+        },
+        now,
+      });
+      if (admission.kind === "skipped") return { kind: "released" as const };
+      const queuedRun = admission.run;
 
       await tx
         .update(issues)
@@ -17076,7 +17027,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(issues.id, issue.id));
 
       return {
-        kind: "queued_recovery" as const,
+        kind: admission.kind === "coalesced" ? "coalesced_recovery" as const : "queued_recovery" as const,
         run: queuedRun,
       };
     });
@@ -17112,21 +17063,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const promotedRun = promotionResult?.run ?? null;
     if (!promotedRun) return;
 
-    if (promotionResult?.kind === "promoted" && promotionResult.reopenedActivity) {
+    if (promotionResult?.reopenedActivity) {
       await logActivity(db, promotionResult.reopenedActivity);
     }
 
-    publishLiveEvent({
-      companyId: promotedRun.companyId,
-      type: "heartbeat.run.queued",
-      payload: {
-        runId: promotedRun.id,
-        agentId: promotedRun.agentId,
-        invocationSource: promotedRun.invocationSource,
-        triggerDetail: promotedRun.triggerDetail,
-        wakeupRequestId: promotedRun.wakeupRequestId,
-      },
-    });
+    if (promotionResult?.kind === "promoted" || promotionResult?.kind === "queued_recovery") {
+      publishLiveEvent({
+        companyId: promotedRun.companyId,
+        type: "heartbeat.run.queued",
+        payload: {
+          runId: promotedRun.id,
+          agentId: promotedRun.agentId,
+          invocationSource: promotedRun.invocationSource,
+          triggerDetail: promotedRun.triggerDetail,
+          wakeupRequestId: promotedRun.wakeupRequestId,
+        },
+      });
+    }
 
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
@@ -18147,47 +18100,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
-        const wakeupRequest = await tx
-          .insert(agentWakeupRequests)
-          .values({
-            companyId: agent.companyId,
-            agentId,
+        const admission = await admitLiveRun({
+          tx,
+          agent,
+          wakeupRequest: {
             source,
             triggerDetail,
             reason,
             payload,
-            status: "queued",
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-
-        const newRun = await tx
-          .insert(heartbeatRuns)
-          .values({
-            companyId: agent.companyId,
-            agentId,
+          },
+          run: {
             invocationSource: source,
             triggerDetail,
-            status: "queued",
             responsibleUserId: await resolveQueuedResponsibleUserId(),
-            wakeupRequestId: wakeupRequest.id,
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
             continuationAttempt,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-
-        await tx
-          .update(agentWakeupRequests)
-          .set({
-            runId: newRun.id,
-            updatedAt: new Date(),
-          })
-          .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+          },
+          coalescing: {
+            taskKey: effectiveTaskKey,
+            canCoalesce: (candidate) => !isZombieRun(candidate, liveRunExecutions),
+            mergeContextSnapshot: mergeCoalescedContextSnapshot,
+          },
+        });
+        if (admission.kind === "skipped") return { kind: "skipped" as const };
+        if (admission.kind === "coalesced") {
+          return { kind: "coalesced" as const, run: admission.run };
+        }
+        const newRun = admission.run;
 
         // executionRunId is NOT stamped here (enqueueWakeup queues the run but
         // doesn't start it). It will be stamped in claimQueuedRun() once the run
@@ -18219,73 +18162,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return newRun;
     }
 
-    const activeRuns = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES])))
-      .orderBy(desc(heartbeatRuns.createdAt));
-
-    const sameScopeQueuedRun = activeRuns.find(
-      (candidate) => candidate.status === "queued" && isSameTaskScope(runTaskKey(candidate), taskKey),
-    );
-    const sameScopeScheduledRetryRun = activeRuns.find(
-      (candidate) => candidate.status === "scheduled_retry" && isSameTaskScope(runTaskKey(candidate), taskKey),
-    );
-    const sameScopeRunningRun = activeRuns.find(
-      (candidate) => candidate.status === "running" && isSameTaskScope(runTaskKey(candidate), taskKey),
-    );
-    const shouldQueueFollowupForRunningWake =
-      Boolean(sameScopeRunningRun) &&
-      !sameScopeQueuedRun &&
-      shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
-    const rawCoalescedTarget =
-      sameScopeQueuedRun ??
-      sameScopeScheduledRetryRun ??
-      (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
-
-    const coalescedTargetRun = filterZombieCoalesceTarget(
-      rawCoalescedTarget,
-      liveRunExecutions,
-    );
-
-    if (coalescedTargetRun) {
-      const mergedContextSnapshot = mergeCoalescedContextSnapshot(
-        coalescedTargetRun.contextSnapshot,
-        enrichedContextSnapshot,
-      );
-      const mergedRun = await db
-        .update(heartbeatRuns)
-        .set({
-          contextSnapshot: mergedContextSnapshot,
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-        .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
-
-      await db.insert(agentWakeupRequests).values({
-        companyId: agent.companyId,
-        agentId,
-        source,
-        triggerDetail,
-        reason,
-        payload,
-        status: "coalesced",
-        coalescedCount: 1,
-        requestedByActorType: opts.requestedByActorType ?? null,
-        requestedByActorId: opts.requestedByActorId ?? null,
-        idempotencyKey: opts.idempotencyKey ?? null,
-        runId: mergedRun.id,
-        finishedAt: new Date(),
-      });
-      return mergedRun;
-    }
-
     const queueOutcome = await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
-      );
-
       const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
       if (dailyCapBlock) {
         const now = new Date();
@@ -18321,52 +18198,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "skipped" as const };
       }
 
-      const wakeupRequest = await tx
-        .insert(agentWakeupRequests)
-        .values({
-          companyId: agent.companyId,
-          agentId,
+      return admitLiveRun({
+        tx,
+        agent,
+        wakeupRequest: {
           source,
           triggerDetail,
           reason,
           payload,
-          status: "queued",
           requestedByActorType: opts.requestedByActorType ?? null,
           requestedByActorId: opts.requestedByActorId ?? null,
           idempotencyKey: opts.idempotencyKey ?? null,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      const newRun = await tx
-        .insert(heartbeatRuns)
-        .values({
-          companyId: agent.companyId,
-          agentId,
+        },
+        run: {
           invocationSource: source,
           triggerDetail,
-          status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
-          wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
-        })
-        .returning()
-        .then((rows) => rows[0]);
-
-      await tx
-        .update(agentWakeupRequests)
-        .set({
-          runId: newRun.id,
-          updatedAt: new Date(),
-        })
-        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
-
-      return { kind: "queued" as const, run: newRun };
+        },
+        coalescing: {
+          taskKey,
+          allowRunning: !shouldQueueFollowupForRunningIssueWake({
+            contextSnapshot: enrichedContextSnapshot,
+            wakeCommentId,
+          }),
+          canCoalesce: (candidate) => !isZombieRun(candidate, liveRunExecutions),
+          mergeContextSnapshot: mergeCoalescedContextSnapshot,
+        },
+      });
     });
 
     if (queueOutcome.kind === "skipped") return null;
+    if (queueOutcome.kind === "coalesced") {
+      await startNextQueuedRunForAgent(agent.id);
+      return queueOutcome.run;
+    }
     const newRun = queueOutcome.run;
 
     publishLiveEvent({
@@ -18733,7 +18601,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     for (const publication of result.publications) publishActivity(publication);
-    if (!result.idempotent) {
+    if (!result.idempotent && result.admissionKind === "queued") {
       publishLiveEvent({
         companyId: result.run.companyId,
         type: "heartbeat.run.queued",

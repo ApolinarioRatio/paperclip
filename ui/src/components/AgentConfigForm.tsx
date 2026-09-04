@@ -1589,6 +1589,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   className={inputClass}
                 />
               </Field>
+              <Field label="Max live runs" hint={help.maxLiveRuns}>
+                <DraftNumberInput
+                  value={eff("heartbeat", "maxLiveRuns", Number(heartbeat.maxLiveRuns ?? 0))}
+                  onCommit={(v) => mark("heartbeat", "maxLiveRuns", v > 0 ? v : undefined)}
+                  immediate
+                  className={inputClass}
+                />
+              </Field>
               <div className="rounded-md border border-border/70 px-3 py-2">
                 <ToggleField
                   label="Continue after max-turn stop"

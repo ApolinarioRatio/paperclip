@@ -34,6 +34,7 @@ import {
 import { issueService } from "../services/issues.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { lockGovernedIssueDecisionLane } from "../services/governed-issue-separation.js";
+import { admitLiveRun } from "../services/live-run-admission.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -945,6 +946,103 @@ describeEmbeddedPostgres("governedQueueDispatchService", () => {
 
     await expect(governedQueueDispatchService(db).dispatch(dispatchInput(fixture)))
       .rejects.toMatchObject({ status: 409, details: { code: "target_queue_policy_disabled" } });
+  });
+
+  it("rejects atomically when the target agent live-run cap is full", async () => {
+    const fixture = await seedDispatchFixture();
+    await db.update(agents).set({
+      runtimeConfig: {
+        governedQueue: { singleActiveAssignment: true },
+        heartbeat: {
+          enabled: false,
+          intervalSec: 0,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+          maxLiveRuns: 1,
+        },
+      },
+    }).where(eq(agents.id, fixture.targetAgentId));
+    await db.insert(heartbeatRuns).values({
+      companyId: fixture.companyId,
+      agentId: fixture.targetAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      responsibleUserId: "alex",
+      contextSnapshot: { taskKey: "issue:other" },
+    });
+
+    await expect(governedQueueDispatchService(db).dispatch(dispatchInput(fixture)))
+      .rejects.toMatchObject({
+        status: 409,
+        details: { code: "heartbeat_live_run_limit", observed: 1, limit: 1 },
+      });
+
+    const issue = await db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]);
+    const approval = await db.select().from(approvals).where(eq(approvals.id, fixture.approvalId)).then((rows) => rows[0]);
+    expect(issue).toMatchObject({ status: "todo", assigneeAgentId: null });
+    expect(approval.status).toBe("pending");
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+  });
+
+  it("never exceeds the target cap when governed dispatch competes with an ordinary wake", async () => {
+    const fixture = await seedDispatchFixture();
+    await db.update(agents).set({
+      runtimeConfig: {
+        governedQueue: { singleActiveAssignment: true },
+        heartbeat: {
+          enabled: false,
+          intervalSec: 0,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+          maxLiveRuns: 1,
+        },
+      },
+    }).where(eq(agents.id, fixture.targetAgentId));
+
+    const [ordinary, governed] = await Promise.allSettled([
+      db.transaction((tx) => admitLiveRun({
+        tx,
+        agent: { id: fixture.targetAgentId, companyId: fixture.companyId },
+        wakeupRequest: {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "ordinary_wake",
+          payload: { taskKey: "issue:ordinary" },
+          requestedByActorType: "system",
+          requestedByActorId: null,
+        },
+        run: {
+          invocationSource: "automation",
+          triggerDetail: "system",
+          responsibleUserId: "alex",
+          contextSnapshot: { taskKey: "issue:ordinary" },
+        },
+        coalescing: {
+          taskKey: "issue:ordinary",
+          mergeContextSnapshot: (existing, incoming) => ({
+            ...(existing && typeof existing === "object" ? existing : {}),
+            ...incoming,
+          }),
+        },
+      })),
+      governedQueueDispatchService(db).dispatch(dispatchInput(fixture)),
+    ]);
+
+    const liveRuns = await db.select().from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, fixture.targetAgentId),
+        eq(heartbeatRuns.status, "queued"),
+      ));
+    expect(liveRuns).toHaveLength(1);
+    if (ordinary.status !== "fulfilled") throw ordinary.reason;
+    if (ordinary.value.kind === "queued") {
+      expect(governed.status).toBe("rejected");
+    } else {
+      expect(ordinary.value.kind).toBe("skipped");
+      expect(governed.status).toBe("fulfilled");
+    }
   });
 
   it.each([

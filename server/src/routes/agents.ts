@@ -1135,6 +1135,15 @@ export function agentRoutes(
     return Number.isFinite(parsed) ? parsed : null;
   }
 
+  function assertValidHeartbeatMaxLiveRuns(runtimeConfig: unknown) {
+    const heartbeat = asRecord(asRecord(runtimeConfig)?.heartbeat);
+    if (!heartbeat || !Object.prototype.hasOwnProperty.call(heartbeat, "maxLiveRuns")) return;
+    const value = heartbeat.maxLiveRuns;
+    if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+      throw unprocessable("runtimeConfig.heartbeat.maxLiveRuns must be a positive integer");
+    }
+  }
+
   function parseSchedulerHeartbeatPolicy(runtimeConfig: unknown) {
     const heartbeat = asRecord(asRecord(runtimeConfig)?.heartbeat) ?? {};
     return {
@@ -2535,6 +2544,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
     assertNoAgentRuntimeConfigAdapterConfigMutation(req, hireInput.runtimeConfig);
+    assertValidHeartbeatMaxLiveRuns(hireInput.runtimeConfig);
     const hiredAgentId = randomUUID();
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
@@ -2731,6 +2741,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     assertNoAgentRuntimeConfigAdapterConfigMutation(req, createInput.runtimeConfig);
+    assertValidHeartbeatMaxLiveRuns(createInput.runtimeConfig);
     const agentId = randomUUID();
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
@@ -3146,6 +3157,7 @@ export function agentRoutes(
         return;
       }
       assertNoAgentRuntimeConfigAdapterConfigMutation(req, runtimeConfig);
+      assertValidHeartbeatMaxLiveRuns(runtimeConfig);
       requestedRuntimeConfig = runtimeConfig;
     }
     const touchesAdapterConfiguration =
