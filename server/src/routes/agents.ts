@@ -27,6 +27,7 @@ import {
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
+  gatewayAuthTokenBindingSchema,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
   startAdapterAuthSessionRequestSchema,
@@ -3761,6 +3762,68 @@ export function agentRoutes(
 
     res.json(result.bundle);
   });
+
+  router.post(
+    "/agents/:id/gateway-auth-token-binding",
+    validate(gatewayAuthTokenBindingSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const id = req.params.id as string;
+      if (!(await getAccessibleAgent(req, res, id))) return;
+
+      const actor = getActorInfo(req);
+      const agent = await svc.updateGatewayAuthTokenBindingCas(
+        id,
+        {
+          ...req.body,
+          actor: {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        },
+      );
+      if (!agent) {
+        res.status(404).json({ error: "Agent not found" });
+        return;
+      }
+
+      const adapterConfig = asRecord(agent.adapterConfig) ?? {};
+      const headers = asRecord(adapterConfig.headers) ?? {};
+      const preservedHeaderKeys = Object.keys(headers).sort();
+
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "agent.gateway_auth_token_bound",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          bindingConfigPath: "authToken",
+          legacyHeaderRemoved: true,
+          preservedHeaderKeys,
+          devicePrivateKeyPresent: adapterConfig.devicePrivateKeyPem != null,
+        },
+      });
+
+      res.json({
+        agentId: agent.id,
+        updatedAt: agent.updatedAt.toISOString(),
+        binding: {
+          configPath: "authToken",
+          redacted: true,
+          legacyHeaderRemoved: true,
+        },
+        preserved: {
+          headerKeys: preservedHeaderKeys,
+          devicePrivateKeyPresent: adapterConfig.devicePrivateKeyPem != null,
+        },
+      });
+    },
+  );
 
   router.patch("/agents/:id", validate(updateAgentSchema), async (req, res) => {
     const id = req.params.id as string;

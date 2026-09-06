@@ -136,6 +136,13 @@ export const updateAgentSchema = objectWithoutDefaults(
 
 export type UpdateAgent = z.infer<typeof updateAgentSchema>;
 
+export const gatewayAuthTokenBindingSchema = z.object({
+  expectedUpdatedAt: z.string().datetime({ offset: true }),
+  value: z.string().min(1),
+});
+
+export type GatewayAuthTokenBinding = z.infer<typeof gatewayAuthTokenBindingSchema>;
+
 export const updateAgentInstructionsPathSchema = z.object({
   path: z.string().trim().min(1).nullable(),
   adapterConfigKey: z.string().trim().min(1).optional(),

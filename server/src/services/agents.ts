@@ -676,7 +676,13 @@ export function agentService(db: Db) {
       normalizedPatch.adapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
         existing.companyId,
         normalizedPatch.adapterConfig,
-        { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
+        {
+          adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string,
+          actor: {
+            userId: options?.recordRevision?.createdByUserId ?? null,
+            agentId: options?.recordRevision?.createdByAgentId ?? null,
+          },
+        },
       );
     }
     // Run the server-enforced binding invariant when the patch touches the
@@ -833,6 +839,73 @@ export function agentService(db: Db) {
     },
 
     update: updateAgent,
+
+    updateGatewayAuthTokenBindingCas: async (
+      id: string,
+      input: {
+        expectedUpdatedAt: string;
+        value: string;
+        actor: { agentId?: string | null; userId?: string | null };
+      },
+    ) => {
+      const expectedUpdatedAt = new Date(input.expectedUpdatedAt);
+      if (Number.isNaN(expectedUpdatedAt.getTime())) {
+        throw unprocessable("expectedUpdatedAt must be an ISO timestamp");
+      }
+      if (!input.value.trim()) {
+        throw unprocessable("Gateway auth token value is required");
+      }
+
+      return db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await tx
+          .select()
+          .from(agents)
+          .where(eq(agents.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        if (existing.adapterType !== "openclaw_gateway") {
+          throw unprocessable("Agent is not configured with the OpenClaw Gateway adapter");
+        }
+        if (existing.updatedAt.getTime() !== expectedUpdatedAt.getTime()) {
+          throw conflict("Agent config changed since it was read", {
+            code: "agent_config_cas_conflict",
+            agentId: id,
+            currentUpdatedAt: existing.updatedAt.toISOString(),
+          });
+        }
+
+        const currentConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
+        const currentHeaders = isPlainRecord(currentConfig.headers) ? currentConfig.headers : {};
+        const nextHeaders = { ...currentHeaders };
+        for (const key of Object.keys(nextHeaders)) {
+          if (["x-openclaw-token", "x-openclaw-auth", "authorization"].includes(key.toLowerCase())) {
+            delete nextHeaders[key];
+          }
+        }
+
+        const updated = await agentService(txDb).update(
+          id,
+          {
+            adapterConfig: {
+              ...currentConfig,
+              headers: nextHeaders,
+              authToken: input.value,
+            },
+          },
+          {
+            recordRevision: {
+              createdByAgentId: input.actor.agentId ?? null,
+              createdByUserId: input.actor.userId ?? null,
+              source: "gateway_auth_token_binding_cas",
+            },
+          },
+        );
+        if (!updated) throw notFound("Agent not found");
+        return updated;
+      });
+    },
 
     pause: async (id: string, reason: "manual" | "budget" | "system" = "manual") => {
       const existing = await getById(id);

@@ -46,6 +46,7 @@ const mockAgentService = vi.hoisted(() => ({
   activatePendingApproval: vi.fn(),
   terminate: vi.fn(),
   update: vi.fn(),
+  updateGatewayAuthTokenBindingCas: vi.fn(),
   updatePermissions: vi.fn(),
   getChainOfCommand: vi.fn(),
   resolveByReference: vi.fn(),
@@ -311,6 +312,7 @@ describe.sequential("agent permission routes", () => {
     mockAgentService.activatePendingApproval.mockReset();
     mockAgentService.terminate.mockReset();
     mockAgentService.update.mockReset();
+    mockAgentService.updateGatewayAuthTokenBindingCas.mockReset();
     mockAgentService.updatePermissions.mockReset();
     mockAgentService.getChainOfCommand.mockReset();
     mockAgentService.resolveByReference.mockReset();
@@ -359,6 +361,16 @@ describe.sequential("agent permission routes", () => {
       activated: false,
     });
     mockAgentService.update.mockResolvedValue(baseAgent);
+    mockAgentService.updateGatewayAuthTokenBindingCas.mockResolvedValue({
+      ...baseAgent,
+      adapterType: "openclaw_gateway",
+      adapterConfig: {
+        headers: { "x-device-id": "device-1" },
+        devicePrivateKeyPem: "secret-ref-placeholder",
+        authToken: { type: "secret_ref", id: "secret-1", version: 1 },
+      },
+      updatedAt: new Date("2026-03-19T00:00:01.000Z"),
+    });
     mockAgentService.updatePermissions.mockResolvedValue(baseAgent);
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(0);
     mockAccessService.canUser.mockResolvedValue(true);
@@ -1864,6 +1876,75 @@ describe.sequential("agent permission routes", () => {
         resource: { type: "company", companyId },
       }));
     });
+  });
+
+  it("atomically binds the OpenClaw gateway token through a board-only redacted route", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/gateway-auth-token-binding`)
+      .send({
+        expectedUpdatedAt: baseAgent.updatedAt.toISOString(),
+        value: "synthetic-new-gateway-token",
+      }));
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.updateGatewayAuthTokenBindingCas).toHaveBeenCalledWith(
+      agentId,
+      {
+        expectedUpdatedAt: baseAgent.updatedAt.toISOString(),
+        value: "synthetic-new-gateway-token",
+        actor: {
+          agentId: null,
+          userId: "board-user",
+        },
+      },
+    );
+    expect(res.body).toEqual({
+      agentId,
+      updatedAt: "2026-03-19T00:00:01.000Z",
+      binding: {
+        configPath: "authToken",
+        redacted: true,
+        legacyHeaderRemoved: true,
+      },
+      preserved: {
+        headerKeys: ["x-device-id"],
+        devicePrivateKeyPresent: true,
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain("synthetic-new-gateway-token");
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "agent.gateway_auth_token_bound",
+      entityType: "agent",
+      entityId: agentId,
+    }));
+  });
+
+  it("rejects agent-key access to the gateway token binding route", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/gateway-auth-token-binding`)
+      .send({
+        expectedUpdatedAt: baseAgent.updatedAt.toISOString(),
+        value: "synthetic-new-gateway-token",
+      }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.updateGatewayAuthTokenBindingCas).not.toHaveBeenCalled();
   });
 
   it("rejects heartbeat cancellation outside the caller company scope", async () => {

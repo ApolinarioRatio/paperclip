@@ -44,13 +44,24 @@ export function buildOpenClawGatewayConfig(v: CreateConfigValues): Record<string
   // Paperclip API override
   if (v.paperclipApiUrl) ac.paperclipApiUrl = v.paperclipApiUrl;
 
-  // Headers — parse headersJson first, then inject authToken on top
+  // Keep authentication in the schema-backed top-level field only.
   const headers = parseJsonObject(v.headersJson ?? "");
-  if (headers) ac.headers = headers;
-  if (v.authToken) {
-    const h = (ac.headers as Record<string, unknown>) ?? {};
-    h["x-openclaw-token"] = v.authToken;
-    ac.headers = h;
+  if (headers) {
+    const legacyAuthEntry = ["x-openclaw-token", "x-openclaw-auth", "authorization"]
+      .map((target) => Object.entries(headers).find(([key]) => key.toLowerCase() === target))
+      .find((entry) => typeof entry?.[1] === "string" && entry[1].trim().length > 0);
+    if (!ac.authToken && legacyAuthEntry) {
+      const legacyValue = (legacyAuthEntry[1] as string).trim();
+      ac.authToken = legacyAuthEntry[0].toLowerCase() === "authorization"
+        ? legacyValue.replace(/^bearer\s+/i, "")
+        : legacyValue;
+    }
+    for (const key of Object.keys(headers)) {
+      if (["x-openclaw-token", "x-openclaw-auth", "authorization"].includes(key.toLowerCase())) {
+        delete headers[key];
+      }
+    }
+    if (Object.keys(headers).length > 0) ac.headers = headers;
   }
 
   // Payload template

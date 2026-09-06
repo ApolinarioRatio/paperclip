@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
+  agentConfigRevisions,
   agents,
   companies,
   companySecretBindings,
@@ -20,6 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
 import { secretService } from "../services/secrets.js";
+import { findActiveServerAdapter } from "../adapters/index.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -47,6 +49,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(companySecretBindings);
+    await db.delete(agentConfigRevisions);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
     await db.delete(companySecretProviderConfigs);
@@ -271,6 +274,137 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     );
     expect(resolved.config.apiKey).toBe(literalApiKey);
     expect(JSON.stringify(persistedConfig)).not.toContain(literalApiKey);
+  });
+
+  it("atomically migrates a legacy OpenClaw token header into the schema-backed authToken secret", async () => {
+    expect(findActiveServerAdapter("openclaw_gateway")?.getConfigSchema).toBeUndefined();
+    const companyId = await seedCompany();
+    const legacyToken = `legacy-openclaw-${randomUUID()}`;
+    const legacyAuthToken = `legacy-openclaw-auth-${randomUUID()}`;
+    const legacyBearerToken = `legacy-openclaw-bearer-${randomUUID()}`;
+    const replacementToken = `replacement-openclaw-${randomUUID()}`;
+    const created = await agentService(db).create(companyId, {
+      name: "OpenClaw Gateway",
+      role: "engineer",
+      status: "idle",
+      adapterType: "openclaw_gateway",
+      adapterConfig: {
+        url: "wss://openclaw.example",
+        headers: {
+          "x-openclaw-token": legacyToken,
+          "X-OpenClaw-Auth": legacyAuthToken,
+          authorization: `Bearer ${legacyBearerToken}`,
+          "x-sibling-header": "preserve-me",
+        },
+        devicePrivateKeyPem: "preserve-device-key",
+      },
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+
+    const updated = await agentService(db).updateGatewayAuthTokenBindingCas(created.id, {
+      expectedUpdatedAt: created.updatedAt.toISOString(),
+      value: replacementToken,
+      actor: { userId: "local-board" },
+    });
+
+    const persisted = await agentService(db).getById(created.id);
+    const persistedConfig = persisted?.adapterConfig as Record<string, unknown>;
+    expect(updated?.id).toBe(created.id);
+    expect(JSON.stringify(persistedConfig)).not.toContain(legacyToken);
+    expect(JSON.stringify(persistedConfig)).not.toContain(legacyAuthToken);
+    expect(JSON.stringify(persistedConfig)).not.toContain(legacyBearerToken);
+    expect(JSON.stringify(persistedConfig)).not.toContain(replacementToken);
+    expect(persistedConfig.authToken).toMatchObject({
+      type: "secret_ref",
+      version: "latest",
+    });
+    expect(persistedConfig.headers).toEqual({ "x-sibling-header": "preserve-me" });
+    expect(persistedConfig.devicePrivateKeyPem).toBe("preserve-device-key");
+
+    const bindings = await db
+      .select()
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetType, "agent"),
+        eq(companySecretBindings.targetId, created.id),
+      ));
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({ configPath: "authToken", versionSelector: "latest" });
+
+    const resolved = await secretService(db).resolveAdapterConfigForRuntime(
+      companyId,
+      persistedConfig,
+      { consumerType: "agent", consumerId: created.id },
+      { adapterType: "openclaw_gateway" },
+    );
+    expect(resolved.config.authToken).toBe(replacementToken);
+    expect(resolved.config.headers).toEqual({ "x-sibling-header": "preserve-me" });
+
+    const revisions = await db
+      .select()
+      .from(agentConfigRevisions)
+      .where(eq(agentConfigRevisions.agentId, created.id));
+    expect(revisions).toHaveLength(1);
+
+    await expect(
+      agentService(db).updateGatewayAuthTokenBindingCas(created.id, {
+        expectedUpdatedAt: created.updatedAt.toISOString(),
+        value: `stale-${randomUUID()}`,
+        actor: { userId: "local-board" },
+      }),
+    ).rejects.toMatchObject({ status: 409, details: { code: "agent_config_cas_conflict" } });
+
+    const storedSecrets = await db
+      .select()
+      .from(companySecrets)
+      .where(eq(companySecrets.companyId, companyId));
+    expect(storedSecrets).toHaveLength(1);
+    expect(storedSecrets[0]?.createdByUserId).toBe("local-board");
+
+    const versions = await db
+      .select()
+      .from(companySecretVersions)
+      .where(eq(companySecretVersions.secretId, storedSecrets[0]!.id));
+    expect(versions).toHaveLength(1);
+    expect(versions[0]?.createdByUserId).toBe("local-board");
+
+    const afterStale = await agentService(db).getById(created.id);
+    expect(afterStale?.adapterConfig).toEqual(persistedConfig);
+    const bindingsAfterStale = await db
+      .select()
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, created.id));
+    expect(bindingsAfterStale).toHaveLength(1);
+    const revisionsAfterStale = await db
+      .select()
+      .from(agentConfigRevisions)
+      .where(eq(agentConfigRevisions.agentId, created.id));
+    expect(revisionsAfterStale).toHaveLength(1);
+  });
+
+  it("rejects gateway-token migration for a non-OpenClaw adapter", async () => {
+    const companyId = await seedCompany();
+    const created = await agentService(db).create(companyId, {
+      name: "Not OpenClaw",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      spentMonthlyCents: 0,
+      lastHeartbeatAt: null,
+    });
+
+    await expect(
+      agentService(db).updateGatewayAuthTokenBindingCas(created.id, {
+        expectedUpdatedAt: created.updatedAt.toISOString(),
+        value: `synthetic-${randomUUID()}`,
+        actor: { userId: "local-board" },
+      }),
+    ).rejects.toMatchObject({ status: 422 });
   });
 
   it("replaces agent secret bindings when adapterConfig env changes", async () => {

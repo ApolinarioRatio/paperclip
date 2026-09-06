@@ -493,16 +493,6 @@ function nonEmptyTrimmedString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function headerMapHasKeyIgnoreCase(
-  headers: Record<string, string>,
-  targetKey: string
-): boolean {
-  const normalizedTarget = targetKey.trim().toLowerCase();
-  return Object.keys(headers).some(
-    (key) => key.trim().toLowerCase() === normalizedTarget
-  );
-}
-
 function headerMapGetIgnoreCase(
   headers: Record<string, string>,
   targetKey: string
@@ -514,6 +504,28 @@ function headerMapGetIgnoreCase(
   if (!key) return null;
   const value = headers[key];
   return typeof value === "string" ? value : null;
+}
+
+function headerMapTakeLastIgnoreCase(
+  headers: Record<string, string>,
+  targetKey: string
+): string | null {
+  const normalizedTarget = targetKey.trim().toLowerCase();
+  let value: string | null = null;
+  for (const [key, candidate] of Object.entries(headers)) {
+    if (key.trim().toLowerCase() === normalizedTarget) value = candidate;
+  }
+  return value;
+}
+
+function headerMapDeleteIgnoreCase(
+  headers: Record<string, string>,
+  targetKey: string
+): void {
+  const normalizedTarget = targetKey.trim().toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.trim().toLowerCase() === normalizedTarget) delete headers[key];
+  }
 }
 
 function tokenFromAuthorizationHeader(rawHeader: string | null): string | null {
@@ -569,37 +581,27 @@ export function buildJoinDefaultsPayloadForAccept(input: {
   const inboundOpenClawTokenHeader = nonEmptyTrimmedString(
     input.inboundOpenClawTokenHeader
   );
-  if (
-    inboundOpenClawTokenHeader &&
-    !headerMapHasKeyIgnoreCase(mergedHeaders, "x-openclaw-token")
-  ) {
+  if (inboundOpenClawTokenHeader) {
     mergedHeaders["x-openclaw-token"] = inboundOpenClawTokenHeader;
   }
-  if (
-    inboundOpenClawAuthHeader &&
-    !headerMapHasKeyIgnoreCase(mergedHeaders, "x-openclaw-auth")
-  ) {
+  if (inboundOpenClawAuthHeader) {
     mergedHeaders["x-openclaw-auth"] = inboundOpenClawAuthHeader;
   }
 
-  if (Object.keys(mergedHeaders).length > 0) {
-    merged.headers = mergedHeaders;
-  } else {
-    delete merged.headers;
-  }
-
   const discoveredToken =
-    headerMapGetIgnoreCase(mergedHeaders, "x-openclaw-token") ??
-    headerMapGetIgnoreCase(mergedHeaders, "x-openclaw-auth") ??
+    nonEmptyTrimmedString(merged.authToken) ??
+    headerMapTakeLastIgnoreCase(mergedHeaders, "x-openclaw-token") ??
+    headerMapTakeLastIgnoreCase(mergedHeaders, "x-openclaw-auth") ??
     tokenFromAuthorizationHeader(
-      headerMapGetIgnoreCase(mergedHeaders, "authorization")
+      headerMapTakeLastIgnoreCase(mergedHeaders, "authorization")
     );
-  if (
-    discoveredToken &&
-    !headerMapHasKeyIgnoreCase(mergedHeaders, "x-openclaw-token")
-  ) {
-    mergedHeaders["x-openclaw-token"] = discoveredToken;
-  }
+  if (discoveredToken) merged.authToken = discoveredToken;
+  headerMapDeleteIgnoreCase(mergedHeaders, "x-openclaw-token");
+  headerMapDeleteIgnoreCase(mergedHeaders, "x-openclaw-auth");
+  headerMapDeleteIgnoreCase(mergedHeaders, "authorization");
+
+  if (Object.keys(mergedHeaders).length > 0) merged.headers = mergedHeaders;
+  else delete merged.headers;
 
   return Object.keys(merged).length > 0 ? merged : null;
 }
@@ -690,13 +692,15 @@ function summarizeOpenClawGatewayDefaultsForLog(defaultsPayload: unknown) {
     ? (defaultsPayload as Record<string, unknown>)
     : null;
   const headers = defaults ? normalizeHeaderMap(defaults.headers) : undefined;
-  const gatewayTokenValue = headers
-    ? headerMapGetIgnoreCase(headers, "x-openclaw-token") ??
+  const gatewayTokenValue =
+    (defaults ? nonEmptyTrimmedString(defaults.authToken) : null) ??
+    (headers
+      ? headerMapGetIgnoreCase(headers, "x-openclaw-token") ??
       headerMapGetIgnoreCase(headers, "x-openclaw-auth") ??
       tokenFromAuthorizationHeader(
         headerMapGetIgnoreCase(headers, "authorization")
       )
-    : null;
+      : null);
   return {
     present: Boolean(defaults),
     keys: defaults ? Object.keys(defaults).sort() : [],
@@ -841,7 +845,7 @@ export function normalizeAgentDefaultsForJoin(input: {
       message:
         "No OpenClaw gateway config was provided in agentDefaultsPayload.",
       hint:
-        "Include agentDefaultsPayload.url and headers.x-openclaw-token for OpenClaw gateway joins."
+        "Include agentDefaultsPayload.url and authToken for OpenClaw gateway joins."
     });
     fatalErrors.push(
       "agentDefaultsPayload is required for adapterType=openclaw_gateway"
@@ -898,12 +902,14 @@ export function normalizeAgentDefaultsForJoin(input: {
 
   const headers = normalizeHeaderMap(defaults.headers) ?? {};
   const gatewayToken =
+    nonEmptyTrimmedString(defaults.authToken) ??
     headerMapGetIgnoreCase(headers, "x-openclaw-token") ??
     headerMapGetIgnoreCase(headers, "x-openclaw-auth") ??
     tokenFromAuthorizationHeader(headerMapGetIgnoreCase(headers, "authorization"));
-  if (gatewayToken && !headerMapHasKeyIgnoreCase(headers, "x-openclaw-token")) {
-    headers["x-openclaw-token"] = gatewayToken;
-  }
+  if (gatewayToken) normalized.authToken = gatewayToken;
+  headerMapDeleteIgnoreCase(headers, "x-openclaw-token");
+  headerMapDeleteIgnoreCase(headers, "x-openclaw-auth");
+  headerMapDeleteIgnoreCase(headers, "authorization");
   if (Object.keys(headers).length > 0) {
     normalized.headers = headers;
   }
@@ -913,11 +919,10 @@ export function normalizeAgentDefaultsForJoin(input: {
       code: "openclaw_gateway_auth_header_missing",
       level: "warn",
       message: "Gateway auth token is missing from agent defaults.",
-      hint:
-        "Set agentDefaultsPayload.headers.x-openclaw-token (or legacy x-openclaw-auth)."
+      hint: "Set agentDefaultsPayload.authToken."
     });
     fatalErrors.push(
-      "agentDefaultsPayload.headers.x-openclaw-token (or x-openclaw-auth) is required"
+      "agentDefaultsPayload.authToken is required"
     );
   } else if (gatewayToken.trim().length < 16) {
     diagnostics.push({
@@ -928,7 +933,7 @@ export function normalizeAgentDefaultsForJoin(input: {
         "Use the full gateway auth token from ~/.openclaw/openclaw.json (typically long random string)."
     });
     fatalErrors.push(
-      "agentDefaultsPayload.headers.x-openclaw-token is too short; expected a full gateway token"
+      "agentDefaultsPayload.authToken is too short; expected a full gateway token"
     );
   } else {
     diagnostics.push({
@@ -1763,7 +1768,7 @@ function buildInviteOnboardingManifest(
     ),
     onboarding: {
       instructions:
-        "Join as an external Paperclip agent, save your one-time claim secret, wait for board approval, then claim your Paperclip API key through the standard claim endpoint. Use requestType='agent', include your agentName and capabilities, and set adapterType plus agentDefaultsPayload for your runtime when applicable. Hermes Gateway agents must use adapterType='hermes_gateway', start a clean Hermes install with API_SERVER_ENABLED=true and a fresh API_SERVER_KEY, then run `hermes gateway run --replace --accept-hooks`. Put the Hermes gateway URL in agentDefaultsPayload.apiBaseUrl, put the exact API_SERVER_KEY value in agentDefaultsPayload.apiKey, and put the reachable Paperclip base URL in agentDefaultsPayload.paperclipApiUrl. If you use the default Hermes dashboard root or /chat URL on port 9119, Paperclip maps it to /api automatically. OpenClaw Gateway agents must use adapterType='openclaw_gateway', set agentDefaultsPayload.url to a ws:// or wss:// gateway endpoint, and include agentDefaultsPayload.headers.x-openclaw-token.",
+        "Join as an external Paperclip agent, save your one-time claim secret, wait for board approval, then claim your Paperclip API key through the standard claim endpoint. Use requestType='agent', include your agentName and capabilities, and set adapterType plus agentDefaultsPayload for your runtime when applicable. Hermes Gateway agents must use adapterType='hermes_gateway', start a clean Hermes install with API_SERVER_ENABLED=true and a fresh API_SERVER_KEY, then run `hermes gateway run --replace --accept-hooks`. Put the Hermes gateway URL in agentDefaultsPayload.apiBaseUrl, put the exact API_SERVER_KEY value in agentDefaultsPayload.apiKey, and put the reachable Paperclip base URL in agentDefaultsPayload.paperclipApiUrl. If you use the default Hermes dashboard root or /chat URL on port 9119, Paperclip maps it to /api automatically. OpenClaw Gateway agents must use adapterType='openclaw_gateway', set agentDefaultsPayload.url to a ws:// or wss:// gateway endpoint, and include agentDefaultsPayload.authToken.",
       inviteMessage: extractInviteMessage(invite),
       recommendedAdapterType: null,
       requiredFields: {
@@ -1773,7 +1778,7 @@ function buildInviteOnboardingManifest(
           "Adapter type for this runtime. Use 'openclaw_gateway' only for OpenClaw Gateway agents. Use 'hermes_gateway' only for Hermes Gateway agents.",
         capabilities: "Optional capability summary",
         agentDefaultsPayload:
-          "Runtime-specific adapter config. OpenClaw Gateway agents must include url (ws:// or wss://) and headers.x-openclaw-token. Hermes Gateway agents must include apiBaseUrl, apiKey set to the Hermes API_SERVER_KEY, and paperclipApiUrl. A default Hermes dashboard root or /chat URL such as http://127.0.0.1:9119/chat is accepted and maps to /api. Other runtimes should include the config their adapter expects."
+          "Runtime-specific adapter config. OpenClaw Gateway agents must include url (ws:// or wss://) and authToken. Hermes Gateway agents must include apiBaseUrl, apiKey set to the Hermes API_SERVER_KEY, and paperclipApiUrl. A default Hermes dashboard root or /chat URL such as http://127.0.0.1:9119/chat is accepted and maps to /api. Other runtimes should include the config their adapter expects."
       },
       registrationEndpoint: {
         method: "POST",
@@ -1913,7 +1918,7 @@ export function buildInviteOnboardingTextDocument(
       "agentDefaultsPayload": {
         "url": "wss://your-openclaw-gateway.example",
         "paperclipApiUrl": "https://paperclip-hostname-your-agent-can-reach:3100",
-        "headers": { "x-openclaw-token": "replace-me" },
+        "authToken": "replace-me",
         "waitTimeoutMs": 120000,
         "sessionKeyStrategy": "issue",
         "role": "operator",
@@ -1921,7 +1926,7 @@ export function buildInviteOnboardingTextDocument(
       }
     }
 
-    For OpenClaw Gateway, include agentDefaultsPayload.headers.x-openclaw-token with your gateway token. Legacy x-openclaw-auth is also accepted, but x-openclaw-token is preferred. Do NOT use /v1/responses or /hooks/* in this gateway join flow.
+    For OpenClaw Gateway, include agentDefaultsPayload.authToken with your gateway token. Legacy token headers are accepted only as migration input and are not persisted. Do NOT use /v1/responses or /hooks/* in this gateway join flow.
 
     Hermes Gateway setup:
     - adapterType: "hermes_gateway"
@@ -4016,7 +4021,7 @@ export function accessRoutes(
           missingPersistedFields.push("paperclipApiUrl");
         }
         if (expectedDefaults.gatewayToken && !persistedDefaults.gatewayToken) {
-          missingPersistedFields.push("headers.x-openclaw-token");
+          missingPersistedFields.push("authToken");
         }
         if (
           expectedDefaults.devicePrivateKeyPem &&

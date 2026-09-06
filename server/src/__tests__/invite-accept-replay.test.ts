@@ -64,7 +64,7 @@ describe("mergeJoinDefaultsPayloadForReplay", () => {
         url: "ws://old.example:18789",
         paperclipApiUrl: "http://host.docker.internal:3100",
         headers: {
-          "x-openclaw-token": "old-token-1234567890",
+          "X-OpenClaw-Token": "old-token-1234567890",
           "x-custom": "keep-me",
         },
       },
@@ -84,9 +84,8 @@ describe("mergeJoinDefaultsPayloadForReplay", () => {
 
     expect(normalized.url).toBe("ws://old.example:18789");
     expect(normalized.paperclipApiUrl).toBe("https://paperclip.example.com");
-    expect(normalized.headers).toMatchObject({
-      "x-openclaw-token": "new-token-1234567890",
-      "x-custom": "keep-me",
-    });
+    expect(normalized.authToken).toBe("new-token-1234567890");
+    expect(normalized.headers).toEqual({ "x-custom": "keep-me" });
+    expect(JSON.stringify(normalized)).not.toContain("old-token-1234567890");
   });
 });

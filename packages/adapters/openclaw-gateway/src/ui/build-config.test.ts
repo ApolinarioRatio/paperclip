@@ -50,4 +50,36 @@ describe("buildOpenClawGatewayConfig", () => {
     expect(config.role).toBe("operator");
     expect(config.scopes).toEqual(["operator.admin"]);
   });
+
+  it("keeps gateway authentication canonical and removes legacy token headers", () => {
+    const config = buildOpenClawGatewayConfig({
+      ...baseValues(),
+      authToken: "synthetic-gateway-token",
+      headersJson: JSON.stringify({
+        "X-OpenClaw-Token": "legacy-token",
+        "x-OPENclaw-auth": "legacy-auth",
+        Authorization: "Bearer legacy-bearer",
+        "x-sibling-header": "preserve-me",
+      }),
+    });
+
+    expect(config.authToken).toBe("synthetic-gateway-token");
+    expect(config.headers).toEqual({ "x-sibling-header": "preserve-me" });
+    expect(JSON.stringify(config)).not.toContain("legacy-token");
+    expect(JSON.stringify(config)).not.toContain("legacy-auth");
+    expect(JSON.stringify(config)).not.toContain("legacy-bearer");
+  });
+
+  it("promotes legacy header input into the canonical authToken field", () => {
+    const config = buildOpenClawGatewayConfig({
+      ...baseValues(),
+      headersJson: JSON.stringify({
+        "X-OpenClaw-Auth": "legacy-auth-input",
+        "x-sibling-header": "preserve-me",
+      }),
+    });
+
+    expect(config.authToken).toBe("legacy-auth-input");
+    expect(config.headers).toEqual({ "x-sibling-header": "preserve-me" });
+  });
 });

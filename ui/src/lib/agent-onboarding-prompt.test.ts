@@ -2,6 +2,15 @@ import { describe, expect, it } from "vitest";
 import { buildAgentOnboardingPrompt } from "./agent-onboarding-prompt";
 
 describe("buildAgentOnboardingPrompt", () => {
+  it("uses the canonical OpenClaw authToken field", () => {
+    const prompt = buildAgentOnboardingPrompt({
+      onboardingTextUrl: "http://localhost:3100/api/invites/token-123/onboarding.txt",
+    });
+
+    expect(prompt).toContain("agentDefaultsPayload.authToken");
+    expect(prompt).not.toContain('headers["x-openclaw-token"]');
+  });
+
   it("includes Hermes Gateway setup guidance for external agents", () => {
     const prompt = buildAgentOnboardingPrompt({
       onboardingTextUrl: "http://localhost:3100/api/invites/token-123/onboarding.txt",
