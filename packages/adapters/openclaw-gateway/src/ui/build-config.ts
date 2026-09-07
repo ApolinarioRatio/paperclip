@@ -12,12 +12,6 @@ function parseJsonObject(text: string): Record<string, unknown> | null {
   }
 }
 
-function normalizeHeaderKeys(headers: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(
-    Object.entries(headers).map(([key, value]) => [key.trim().toLowerCase(), value]),
-  );
-}
-
 export function buildOpenClawGatewayConfig(v: CreateConfigValues): Record<string, unknown> {
   const ac: Record<string, unknown> = {};
 
@@ -50,13 +44,20 @@ export function buildOpenClawGatewayConfig(v: CreateConfigValues): Record<string
   // Paperclip API override
   if (v.paperclipApiUrl) ac.paperclipApiUrl = v.paperclipApiUrl;
 
-  // Headers — parse headersJson first, then inject authToken on top
+  // Legacy headers are migration input only. Explicit authToken wins.
   const headers = parseJsonObject(v.headersJson ?? "");
-  if (headers) ac.headers = normalizeHeaderKeys(headers);
-  if (v.authToken) {
-    const h = (ac.headers as Record<string, unknown>) ?? {};
-    h["x-openclaw-token"] = v.authToken;
-    ac.headers = h;
+  if (headers) {
+    const remaining = { ...headers };
+    for (const [key, value] of Object.entries(remaining)) {
+      const name = key.trim().toLowerCase();
+      if (["x-openclaw-token", "x-openclaw-auth", "authorization"].includes(name)) {
+        if (!ac.authToken && typeof value === "string") {
+          ac.authToken = name === "authorization" ? value.trim().replace(/^bearer\s+/i, "") : value;
+        }
+        delete remaining[key];
+      }
+    }
+    if (Object.keys(remaining).length > 0) ac.headers = remaining;
   }
 
   // Payload template

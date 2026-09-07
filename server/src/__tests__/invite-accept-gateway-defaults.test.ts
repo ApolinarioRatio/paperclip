@@ -33,6 +33,14 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describe("buildJoinDefaultsPayloadForAccept (openclaw_gateway)", () => {
+  it("keeps a canonical reference ahead of conflicting legacy replay input", () => {
+    const reference = { type: "secret_ref", secretId: randomUUID(), version: "latest" };
+    const result = buildJoinDefaultsPayloadForAccept({ adapterType: "openclaw_gateway", defaultsPayload: {
+      authToken: reference, headers: { " Authorization ": randomUUID() },
+    }, inboundOpenClawTokenHeader: randomUUID() }) as Record<string, unknown>;
+    expect(result.authToken).toEqual(reference);
+    expect(result.headers).toBeUndefined();
+  });
   it("leaves non-gateway payloads unchanged", () => {
     const defaultsPayload = { command: "echo hello" };
     const result = buildJoinDefaultsPayloadForAccept({
@@ -57,12 +65,8 @@ describe("buildJoinDefaultsPayloadForAccept (openclaw_gateway)", () => {
       },
     }) as Record<string, unknown>;
 
-    expect(result).toMatchObject({
-      url: "ws://127.0.0.1:18789",
-      headers: {
-        "x-openclaw-token": "gateway-token-1234567890",
-      },
-    });
+    expect(result.authToken === "gateway-token-1234567890").toBe(true);
+    expect(result.headers).toBeUndefined();
   });
 
   it("accepts inbound x-openclaw-token for gateway joins", () => {
@@ -74,11 +78,8 @@ describe("buildJoinDefaultsPayloadForAccept (openclaw_gateway)", () => {
       inboundOpenClawTokenHeader: "gateway-token-1234567890",
     }) as Record<string, unknown>;
 
-    expect(result).toMatchObject({
-      headers: {
-        "x-openclaw-token": "gateway-token-1234567890",
-      },
-    });
+    expect(result.authToken === "gateway-token-1234567890").toBe(true);
+    expect(result.headers).toBeUndefined();
   });
 
   it("derives x-openclaw-token from authorization header", () => {
@@ -92,12 +93,8 @@ describe("buildJoinDefaultsPayloadForAccept (openclaw_gateway)", () => {
       },
     }) as Record<string, unknown>;
 
-    expect(result).toMatchObject({
-      headers: {
-        authorization: "Bearer gateway-token-1234567890",
-        "x-openclaw-token": "gateway-token-1234567890",
-      },
-    });
+    expect(result.authToken === "gateway-token-1234567890").toBe(true);
+    expect(result.headers).toBeUndefined();
   });
 });
 
@@ -283,6 +280,30 @@ describeEmbeddedPostgres("prepareAgentDefaultsPayloadForJoinPersistence (hermes_
       process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
     }
     rmSync(secretsTmpDir, { recursive: true, force: true });
+  });
+
+  it.each([" X-OpenClaw-Token ", " X-OPENCLAW-AUTH ", " Authorization "])("persists OpenClaw legacy join input only as a managed canonical reference: %s", async (header) => {
+    const companyId = randomUUID();
+    const inviteId = randomUUID();
+    const value = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Gateway fixture", issuePrefix: companyId.slice(0, 8) });
+    await db.insert(invites).values({ id: inviteId, companyId, inviteType: "company_join", tokenHash: randomUUID(), allowedJoinTypes: "agent", expiresAt: new Date(Date.now() + 60_000) });
+    const payload = buildJoinDefaultsPayloadForAccept({ adapterType: "openclaw_gateway", defaultsPayload: {
+      url: "ws://127.0.0.1:18789", disableDeviceAuth: true,
+      headers: { [header]: header.trim().toLowerCase() === "authorization" ? `Bearer ${value}` : value, "X-Sibling": "keep" },
+    } });
+    const normalized = normalizeAgentDefaultsForJoin({ adapterType: "openclaw_gateway", defaultsPayload: payload,
+      deploymentMode: "authenticated", deploymentExposure: "private", bindHost: "127.0.0.1", allowedHostnames: [] });
+    expect(normalized.fatalErrors).toEqual([]);
+    const persisted = await prepareAgentDefaultsPayloadForJoinPersistence({ db, companyId, adapterType: "openclaw_gateway", normalized: normalized.normalized, actor: { userId: "fixture-owner" } });
+    const [request] = await db.insert(joinRequests).values({ companyId, inviteId, requestType: "agent", requestIp: "127.0.0.1", status: "pending_approval", adapterType: "openclaw_gateway", agentName: "Gateway fixture", agentDefaultsPayload: persisted }).returning();
+    const stored = request!.agentDefaultsPayload as Record<string, unknown>;
+    expect(JSON.stringify(stored).includes(value)).toBe(false);
+    expect((stored.authToken as Record<string, unknown>).type).toBe("secret_ref");
+    expect(Object.keys(stored.headers as object).some((key) => ["x-openclaw-token", "x-openclaw-auth", "authorization"].includes(key.trim().toLowerCase()))).toBe(false);
+    const secrets = await db.select().from(companySecrets).where(eq(companySecrets.companyId, companyId));
+    expect(secrets.length).toBe(1);
+    expect(secrets[0]!.createdByUserId).toBe("fixture-owner");
   });
 
   it("stores a secret ref instead of the literal apiKey in join request defaults", async () => {

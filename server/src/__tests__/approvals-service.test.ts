@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { approvalService } from "../services/approvals.ts";
 
 const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null),
   activatePendingApproval: vi.fn(),
   create: vi.fn(),
   terminate: vi.fn(),
@@ -101,7 +102,7 @@ describe("approvalService resolution idempotency", () => {
     const result = await svc.approve("approval-1", "board", "ship it");
 
     expect(result.applied).toBe(true);
-    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload);
+    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload, { userId: "board" });
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 

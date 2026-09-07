@@ -49,6 +49,29 @@ jobs:
           server/src/__tests__/health.test.ts
           server/src/__tests__/governed-queue-dispatch.test.ts
           server/src/__tests__/issue-comment-reopen-routes.test.ts
+          packages/adapters/openclaw-gateway/src/ui/build-config.test.ts
+          server/src/__tests__/agent-permissions-routes.test.ts
+          server/src/__tests__/agents-adapter-config-user-secret.test.ts
+          server/src/__tests__/agents-pending-approval-config.test.ts
+          server/src/__tests__/agents-service-secret-bindings.test.ts
+          server/src/__tests__/approval-routes-idempotency.test.ts
+          server/src/__tests__/approvals-service.test.ts
+          server/src/__tests__/company-portability-import-batching.test.ts
+          server/src/__tests__/company-portability-routes.test.ts
+          server/src/__tests__/company-portability.test.ts
+          server/src/__tests__/http-log-policy.test.ts
+          server/src/__tests__/http-log-redaction.test.ts
+          server/src/__tests__/invite-accept-existing-member.test.ts
+          server/src/__tests__/invite-accept-gateway-defaults.test.ts
+          server/src/__tests__/invite-accept-replay.test.ts
+          server/src/__tests__/invite-onboarding-text.test.ts
+          server/src/__tests__/openclaw-credential-persistence.test.ts
+          server/src/__tests__/openclaw-credential-response.test.ts
+          server/src/__tests__/openclaw-gateway-adapter.test.ts
+          server/src/__tests__/redact-sensitive.test.ts
+          server/src/__tests__/redaction.test.ts
+          server/src/__tests__/secrets-service.test.ts
+          ui/src/lib/agent-onboarding-prompt.test.ts
 
       - name: Build workspaces
         run: pnpm build

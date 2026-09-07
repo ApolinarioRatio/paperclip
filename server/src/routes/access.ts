@@ -1,3 +1,4 @@
+import { publishActivity, publishGatewayActivities, type ActivityPublication } from "../services/activity-log.js";
 import {
   createHash,
   generateKeyPairSync,
@@ -56,6 +57,7 @@ import {
   badRequest,
   tooManyRequests
 } from "../errors.js";
+import { redactOpenClawAgentResponse } from "../redaction.js";
 import {
   createInviteRateLimiter,
   type InviteRateLimiter,
@@ -285,6 +287,10 @@ function listAvailableSkills(): AvailableSkill[] {
 
 function toJoinRequestResponse(row: typeof joinRequests.$inferSelect) {
   const { claimSecretHash: _claimSecretHash, ...safe } = row;
+  if (row.adapterType === "openclaw_gateway") {
+    const projected = redactOpenClawAgentResponse({ adapterType: row.adapterType, adapterConfig: row.agentDefaultsPayload }) as { adapterConfig: unknown };
+    return { ...safe, agentDefaultsPayload: projected.adapterConfig };
+  }
   return safe;
 }
 
@@ -472,16 +478,6 @@ function nonEmptyTrimmedString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function headerMapHasKeyIgnoreCase(
-  headers: Record<string, string>,
-  targetKey: string
-): boolean {
-  const normalizedTarget = targetKey.trim().toLowerCase();
-  return Object.keys(headers).some(
-    (key) => key.trim().toLowerCase() === normalizedTarget
-  );
-}
-
 function headerMapGetIgnoreCase(
   headers: Record<string, string>,
   targetKey: string
@@ -493,6 +489,28 @@ function headerMapGetIgnoreCase(
   if (!key) return null;
   const value = headers[key];
   return typeof value === "string" ? value : null;
+}
+
+function headerMapTakeLastIgnoreCase(
+  headers: Record<string, string>,
+  targetKey: string
+): string | null {
+  const normalizedTarget = targetKey.trim().toLowerCase();
+  let value: string | null = null;
+  for (const [key, candidate] of Object.entries(headers)) {
+    if (key.trim().toLowerCase() === normalizedTarget) value = candidate;
+  }
+  return value;
+}
+
+function headerMapDeleteIgnoreCase(
+  headers: Record<string, string>,
+  targetKey: string
+): void {
+  const normalizedTarget = targetKey.trim().toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.trim().toLowerCase() === normalizedTarget) delete headers[key];
+  }
 }
 
 function tokenFromAuthorizationHeader(rawHeader: string | null): string | null {
@@ -548,37 +566,27 @@ export function buildJoinDefaultsPayloadForAccept(input: {
   const inboundOpenClawTokenHeader = nonEmptyTrimmedString(
     input.inboundOpenClawTokenHeader
   );
-  if (
-    inboundOpenClawTokenHeader &&
-    !headerMapHasKeyIgnoreCase(mergedHeaders, "x-openclaw-token")
-  ) {
+  if (inboundOpenClawTokenHeader) {
     mergedHeaders["x-openclaw-token"] = inboundOpenClawTokenHeader;
   }
-  if (
-    inboundOpenClawAuthHeader &&
-    !headerMapHasKeyIgnoreCase(mergedHeaders, "x-openclaw-auth")
-  ) {
+  if (inboundOpenClawAuthHeader) {
     mergedHeaders["x-openclaw-auth"] = inboundOpenClawAuthHeader;
   }
 
-  if (Object.keys(mergedHeaders).length > 0) {
-    merged.headers = mergedHeaders;
-  } else {
-    delete merged.headers;
-  }
-
   const discoveredToken =
-    headerMapGetIgnoreCase(mergedHeaders, "x-openclaw-token") ??
-    headerMapGetIgnoreCase(mergedHeaders, "x-openclaw-auth") ??
+    nonEmptyTrimmedString(merged.authToken) ??
+    headerMapTakeLastIgnoreCase(mergedHeaders, "x-openclaw-token") ??
+    headerMapTakeLastIgnoreCase(mergedHeaders, "x-openclaw-auth") ??
     tokenFromAuthorizationHeader(
-      headerMapGetIgnoreCase(mergedHeaders, "authorization")
+      headerMapTakeLastIgnoreCase(mergedHeaders, "authorization")
     );
-  if (
-    discoveredToken &&
-    !headerMapHasKeyIgnoreCase(mergedHeaders, "x-openclaw-token")
-  ) {
-    mergedHeaders["x-openclaw-token"] = discoveredToken;
-  }
+  if (!Object.prototype.hasOwnProperty.call(merged, "authToken") && discoveredToken) merged.authToken = discoveredToken;
+  headerMapDeleteIgnoreCase(mergedHeaders, "x-openclaw-token");
+  headerMapDeleteIgnoreCase(mergedHeaders, "x-openclaw-auth");
+  headerMapDeleteIgnoreCase(mergedHeaders, "authorization");
+
+  if (Object.keys(mergedHeaders).length > 0) merged.headers = mergedHeaders;
+  else delete merged.headers;
 
   return Object.keys(merged).length > 0 ? merged : null;
 }
@@ -654,13 +662,12 @@ export function canReplayOpenClawGatewayInviteAccept(input: {
 
 function summarizeSecretForLog(
   value: unknown
-): { present: true; length: number; sha256Prefix: string } | null {
+): { present: true } | null {
+  if (isPlainObject(value) && value.type === "secret_ref") return { present: true };
   const trimmed = nonEmptyTrimmedString(value);
   if (!trimmed) return null;
   return {
     present: true,
-    length: trimmed.length,
-    sha256Prefix: hashToken(trimmed).slice(0, 12)
   };
 }
 
@@ -669,13 +676,15 @@ function summarizeOpenClawGatewayDefaultsForLog(defaultsPayload: unknown) {
     ? (defaultsPayload as Record<string, unknown>)
     : null;
   const headers = defaults ? normalizeHeaderMap(defaults.headers) : undefined;
-  const gatewayTokenValue = headers
-    ? headerMapGetIgnoreCase(headers, "x-openclaw-token") ??
+  const gatewayTokenValue =
+    (defaults ? nonEmptyTrimmedString(defaults.authToken) : null) ??
+    (headers
+      ? headerMapGetIgnoreCase(headers, "x-openclaw-token") ??
       headerMapGetIgnoreCase(headers, "x-openclaw-auth") ??
       tokenFromAuthorizationHeader(
         headerMapGetIgnoreCase(headers, "authorization")
       )
-    : null;
+      : null);
   return {
     present: Boolean(defaults),
     keys: defaults ? Object.keys(defaults).sort() : [],
@@ -697,7 +706,7 @@ function summarizeOpenClawGatewayDefaultsForLog(defaultsPayload: unknown) {
     devicePrivateKeyPem: defaults
       ? summarizeSecretForLog(defaults.devicePrivateKeyPem)
       : null,
-    gatewayToken: summarizeSecretForLog(gatewayTokenValue)
+    gatewayToken: summarizeSecretForLog(defaults?.authToken ?? gatewayTokenValue)
   };
 }
 
@@ -820,7 +829,7 @@ export function normalizeAgentDefaultsForJoin(input: {
       message:
         "No OpenClaw gateway config was provided in agentDefaultsPayload.",
       hint:
-        "Include agentDefaultsPayload.url and headers.x-openclaw-token for OpenClaw gateway joins."
+        "Include agentDefaultsPayload.url and authToken for OpenClaw gateway joins."
     });
     fatalErrors.push(
       "agentDefaultsPayload is required for adapterType=openclaw_gateway"
@@ -876,29 +885,33 @@ export function normalizeAgentDefaultsForJoin(input: {
   }
 
   const headers = normalizeHeaderMap(defaults.headers) ?? {};
-  const gatewayToken =
+  const hasCanonicalToken = Object.prototype.hasOwnProperty.call(defaults, "authToken");
+  const hasCanonicalRef = isPlainObject(defaults.authToken)
+    && defaults.authToken.type === "secret_ref" && typeof defaults.authToken.secretId === "string";
+  const gatewayToken = hasCanonicalToken ? nonEmptyTrimmedString(defaults.authToken) : (
     headerMapGetIgnoreCase(headers, "x-openclaw-token") ??
     headerMapGetIgnoreCase(headers, "x-openclaw-auth") ??
-    tokenFromAuthorizationHeader(headerMapGetIgnoreCase(headers, "authorization"));
-  if (gatewayToken && !headerMapHasKeyIgnoreCase(headers, "x-openclaw-token")) {
-    headers["x-openclaw-token"] = gatewayToken;
-  }
+    tokenFromAuthorizationHeader(headerMapGetIgnoreCase(headers, "authorization")));
+  if (hasCanonicalToken) normalized.authToken = defaults.authToken;
+  else if (gatewayToken) normalized.authToken = gatewayToken;
+  headerMapDeleteIgnoreCase(headers, "x-openclaw-token");
+  headerMapDeleteIgnoreCase(headers, "x-openclaw-auth");
+  headerMapDeleteIgnoreCase(headers, "authorization");
   if (Object.keys(headers).length > 0) {
     normalized.headers = headers;
   }
 
-  if (!gatewayToken) {
+  if (!gatewayToken && !hasCanonicalRef) {
     diagnostics.push({
       code: "openclaw_gateway_auth_header_missing",
       level: "warn",
       message: "Gateway auth token is missing from agent defaults.",
-      hint:
-        "Set agentDefaultsPayload.headers.x-openclaw-token (or legacy x-openclaw-auth)."
+      hint: "Set agentDefaultsPayload.authToken."
     });
     fatalErrors.push(
-      "agentDefaultsPayload.headers.x-openclaw-token (or x-openclaw-auth) is required"
+      "agentDefaultsPayload.authToken is required"
     );
-  } else if (gatewayToken.trim().length < 16) {
+  } else if (gatewayToken && gatewayToken.trim().length < 16) {
     diagnostics.push({
       code: "openclaw_gateway_auth_header_too_short",
       level: "warn",
@@ -907,7 +920,7 @@ export function normalizeAgentDefaultsForJoin(input: {
         "Use the full gateway auth token from ~/.openclaw/openclaw.json (typically long random string)."
     });
     fatalErrors.push(
-      "agentDefaultsPayload.headers.x-openclaw-token is too short; expected a full gateway token"
+      "agentDefaultsPayload.authToken is too short; expected a full gateway token"
     );
   } else {
     diagnostics.push({
@@ -927,9 +940,9 @@ export function normalizeAgentDefaultsForJoin(input: {
     normalized.disableDeviceAuth = parsedDisableDeviceAuth;
   }
 
-  const configuredDevicePrivateKeyPem = nonEmptyTrimmedString(
-    defaults.devicePrivateKeyPem
-  );
+  const configuredDevicePrivateKeyPem = isPlainObject(defaults.devicePrivateKeyPem)
+    && ["secret_ref", "user_secret_ref"].includes(String(defaults.devicePrivateKeyPem.type))
+    ? defaults.devicePrivateKeyPem : nonEmptyTrimmedString(defaults.devicePrivateKeyPem);
   if (configuredDevicePrivateKeyPem) {
     normalized.devicePrivateKeyPem = configuredDevicePrivateKeyPem;
     diagnostics.push({
@@ -1056,7 +1069,7 @@ export async function prepareAgentDefaultsPayloadForJoinPersistence(input: {
   normalized: Record<string, unknown> | null;
   actor?: { userId?: string | null; agentId?: string | null };
 }): Promise<Record<string, unknown> | null> {
-  if (input.adapterType !== "hermes_gateway" || !input.normalized) {
+  if (!input.normalized || (input.adapterType !== "hermes_gateway" && input.adapterType !== "openclaw_gateway")) {
     return input.normalized;
   }
 
@@ -1733,7 +1746,7 @@ function buildInviteOnboardingManifest(
     ),
     onboarding: {
       instructions:
-        "Join as an external Paperclip agent, save your one-time claim secret, wait for board approval, then claim your Paperclip API key through the standard claim endpoint. Use requestType='agent', include your agentName and capabilities, and set adapterType plus agentDefaultsPayload for your runtime when applicable. Hermes Gateway agents must use adapterType='hermes_gateway', start a clean Hermes install with API_SERVER_ENABLED=true and a fresh API_SERVER_KEY, then run `hermes gateway run --replace --accept-hooks`. Put the Hermes gateway URL in agentDefaultsPayload.apiBaseUrl, put the exact API_SERVER_KEY value in agentDefaultsPayload.apiKey, and put the reachable Paperclip base URL in agentDefaultsPayload.paperclipApiUrl. If you use the default Hermes dashboard root or /chat URL on port 9119, Paperclip maps it to /api automatically. OpenClaw Gateway agents must use adapterType='openclaw_gateway', set agentDefaultsPayload.url to a ws:// or wss:// gateway endpoint, and include agentDefaultsPayload.headers.x-openclaw-token.",
+        "Join as an external Paperclip agent, save your one-time claim secret, wait for board approval, then claim your Paperclip API key through the standard claim endpoint. Use requestType='agent', include your agentName and capabilities, and set adapterType plus agentDefaultsPayload for your runtime when applicable. Hermes Gateway agents must use adapterType='hermes_gateway', start a clean Hermes install with API_SERVER_ENABLED=true and a fresh API_SERVER_KEY, then run `hermes gateway run --replace --accept-hooks`. Put the Hermes gateway URL in agentDefaultsPayload.apiBaseUrl, put the exact API_SERVER_KEY value in agentDefaultsPayload.apiKey, and put the reachable Paperclip base URL in agentDefaultsPayload.paperclipApiUrl. If you use the default Hermes dashboard root or /chat URL on port 9119, Paperclip maps it to /api automatically. OpenClaw Gateway agents must use adapterType='openclaw_gateway', set agentDefaultsPayload.url to a ws:// or wss:// gateway endpoint, and include agentDefaultsPayload.authToken.",
       inviteMessage: extractInviteMessage(invite),
       recommendedAdapterType: null,
       requiredFields: {
@@ -1743,7 +1756,7 @@ function buildInviteOnboardingManifest(
           "Adapter type for this runtime. Use 'openclaw_gateway' only for OpenClaw Gateway agents. Use 'hermes_gateway' only for Hermes Gateway agents.",
         capabilities: "Optional capability summary",
         agentDefaultsPayload:
-          "Runtime-specific adapter config. OpenClaw Gateway agents must include url (ws:// or wss://) and headers.x-openclaw-token. Hermes Gateway agents must include apiBaseUrl, apiKey set to the Hermes API_SERVER_KEY, and paperclipApiUrl. A default Hermes dashboard root or /chat URL such as http://127.0.0.1:9119/chat is accepted and maps to /api. Other runtimes should include the config their adapter expects."
+          "Runtime-specific adapter config. OpenClaw Gateway agents must include url (ws:// or wss://) and authToken. Hermes Gateway agents must include apiBaseUrl, apiKey set to the Hermes API_SERVER_KEY, and paperclipApiUrl. A default Hermes dashboard root or /chat URL such as http://127.0.0.1:9119/chat is accepted and maps to /api. Other runtimes should include the config their adapter expects."
       },
       registrationEndpoint: {
         method: "POST",
@@ -1882,7 +1895,7 @@ export function buildInviteOnboardingTextDocument(
       "agentDefaultsPayload": {
         "url": "wss://your-openclaw-gateway.example",
         "paperclipApiUrl": "https://paperclip-hostname-your-agent-can-reach:3100",
-        "headers": { "x-openclaw-token": "replace-me" },
+        "authToken": "replace-me",
         "waitTimeoutMs": 120000,
         "sessionKeyStrategy": "issue",
         "role": "operator",
@@ -1890,7 +1903,7 @@ export function buildInviteOnboardingTextDocument(
       }
     }
 
-    For OpenClaw Gateway, include agentDefaultsPayload.headers.x-openclaw-token with your gateway token. Legacy x-openclaw-auth is also accepted, but x-openclaw-token is preferred. Do NOT use /v1/responses or /hooks/* in this gateway join flow.
+    For OpenClaw Gateway, include agentDefaultsPayload.authToken with your gateway token. Legacy token headers are accepted only as migration input and are not persisted. Do NOT use /v1/responses or /hooks/* in this gateway join flow.
 
     Hermes Gateway setup:
     - adapterType: "hermes_gateway"
@@ -3781,36 +3794,12 @@ export function accessRoutes(
         throw badRequest(joinDefaults.fatalErrors.join("; "));
       }
 
-      const persistedJoinDefaultsPayload =
-        requestType === "agent"
-          ? await prepareAgentDefaultsPayloadForJoinPersistence({
-              db,
-              companyId,
-              adapterType,
-              normalized: joinDefaults.normalized,
-              actor: {
-                userId: req.actor.userId ?? null,
-                agentId: req.actor.agentId ?? null
-              }
-            })
-          : null;
-
-      if (requestType === "agent" && adapterType === "openclaw_gateway") {
-        logger.info(
-          {
-            inviteId: invite.id,
-            joinRequestDiagnostics: joinDefaults.diagnostics.map((diag) => ({
-              code: diag.code,
-              level: diag.level
-            })),
-            normalizedAgentDefaults: summarizeOpenClawGatewayDefaultsForLog(
-              joinDefaults.normalized
-            )
-          },
-          "invite accept normalized OpenClaw gateway defaults"
-        );
+      if (inviteAlreadyAccepted && adapterType === "openclaw_gateway" && existingJoinRequestForInvite?.status === "approved" && existingJoinRequestForInvite.createdAgentId) {
+        const decision = await access.decide({ actor: req.actor, action: "agent_config:update", resource: {
+          type: "agent", companyId, agentId: existingJoinRequestForInvite.createdAgentId,
+        } });
+        if (!decision.allowed) throw forbidden("Gateway credential replay requires agent_config:update permission");
       }
-
       const claimSecret =
         requestType === "agent" && !inviteAlreadyAccepted
           ? createClaimSecret()
@@ -3839,130 +3828,193 @@ export function accessRoutes(
               }
             )
           : null;
-      let created = !inviteAlreadyAccepted
-        ? existingHumanJoinRequest
-          ? await db.transaction(async (tx) => {
-              await tx
-                .update(invites)
-                .set({ acceptedAt: new Date(), updatedAt: new Date() })
-                .where(
-                  and(
-                    eq(invites.id, invite.id),
-                    isNull(invites.acceptedAt),
-                    isNull(invites.revokedAt)
-                  )
-                );
-              return existingHumanJoinRequest;
-            })
-          : await db.transaction(async (tx) => {
-              await tx
-                .update(invites)
-                .set({ acceptedAt: new Date(), updatedAt: new Date() })
-                .where(
-                  and(
-                    eq(invites.id, invite.id),
-                    isNull(invites.acceptedAt),
-                    isNull(invites.revokedAt)
-                  )
-                );
+      const publications: ActivityPublication[] = [];
+      const persistAccept = async (db: Db) => {
+        const persistedJoinDefaultsPayload =
+          requestType === "agent"
+            ? await prepareAgentDefaultsPayloadForJoinPersistence({
+                db,
+                companyId,
+                adapterType,
+                normalized: joinDefaults.normalized,
+                actor: {
+                  userId: req.actor.userId ?? null,
+                  agentId: req.actor.agentId ?? null
+                }
+              })
+            : null;
 
-              const row = await tx
-                .insert(joinRequests)
-                .values({
-                  inviteId: invite.id,
-                  companyId,
-                  requestType,
-                  status: "pending_approval",
-                  requestIp: requestIp(req),
-                  requestingUserId:
-                    requestType === "human"
-                      ? req.actor.userId ?? "local-board"
-                      : null,
-                  requestEmailSnapshot:
-                    requestType === "human" ? actorEmail : null,
-                  agentName:
-                    requestType === "agent" ? req.body.agentName : null,
-                  adapterType: requestType === "agent" ? adapterType : null,
-                  capabilities:
-                    requestType === "agent"
-                      ? req.body.capabilities ?? null
-                      : null,
-                  agentDefaultsPayload:
-                    requestType === "agent" ? persistedJoinDefaultsPayload : null,
-                  claimSecretHash,
-                  claimSecretExpiresAt
-                })
-                .returning()
-                .then((rows) => rows[0]);
-              return row;
-            })
-        : await db
-            .update(joinRequests)
-            .set({
-              requestIp: requestIp(req),
-              agentName:
-                requestType === "agent"
-                  ? req.body.agentName ??
-                    existingJoinRequestForInvite?.agentName ??
-                    null
-                  : null,
-              capabilities:
-                requestType === "agent"
-                  ? req.body.capabilities ??
-                    existingJoinRequestForInvite?.capabilities ??
-                    null
-                  : null,
-              adapterType: requestType === "agent" ? adapterType : null,
-              agentDefaultsPayload:
-                requestType === "agent" ? persistedJoinDefaultsPayload : null,
-              updatedAt: new Date()
-            })
-            .where(eq(joinRequests.id, replayJoinRequestId as string))
-            .returning()
-            .then((rows) => rows[0]);
-
-      if (!created) {
-        throw conflict("Join request not found");
-      }
-
-      if (
-        inviteAlreadyAccepted &&
-        requestType === "agent" &&
-        adapterType === "openclaw_gateway" &&
-        created.status === "approved" &&
-        created.createdAgentId
-      ) {
-        const existingAgent = await agents.getById(created.createdAgentId);
-        if (!existingAgent) {
-          throw conflict("Approved join request agent not found");
+        if (requestType === "agent" && adapterType === "openclaw_gateway") {
+          logger.info(
+            {
+              inviteId: invite.id,
+              joinRequestDiagnostics: joinDefaults.diagnostics.map((diag) => ({
+                code: diag.code,
+                level: diag.level
+              })),
+              normalizedAgentDefaults: summarizeOpenClawGatewayDefaultsForLog(
+                joinDefaults.normalized
+              )
+            },
+            "invite accept normalized OpenClaw gateway defaults"
+          );
         }
-        const existingAdapterConfig = isPlainObject(existingAgent.adapterConfig)
-          ? (existingAgent.adapterConfig as Record<string, unknown>)
-          : {};
-        const nextAdapterConfig = {
-          ...existingAdapterConfig,
-          ...(joinDefaults.normalized ?? {})
-        };
-        const updatedAgent = await agents.update(created.createdAgentId, {
-          adapterType,
-          adapterConfig: nextAdapterConfig
-        });
-        if (!updatedAgent) {
-          throw conflict("Approved join request agent not found");
+
+        let created = !inviteAlreadyAccepted
+          ? existingHumanJoinRequest
+            ? await db.transaction(async (tx) => {
+                await tx
+                  .update(invites)
+                  .set({ acceptedAt: new Date(), updatedAt: new Date() })
+                  .where(
+                    and(
+                      eq(invites.id, invite.id),
+                      isNull(invites.acceptedAt),
+                      isNull(invites.revokedAt)
+                    )
+                  );
+                return existingHumanJoinRequest;
+              })
+            : await db.transaction(async (tx) => {
+                await tx
+                  .update(invites)
+                  .set({ acceptedAt: new Date(), updatedAt: new Date() })
+                  .where(
+                    and(
+                      eq(invites.id, invite.id),
+                      isNull(invites.acceptedAt),
+                      isNull(invites.revokedAt)
+                    )
+                  );
+
+                const row = await tx
+                  .insert(joinRequests)
+                  .values({
+                    inviteId: invite.id,
+                    companyId,
+                    requestType,
+                    status: "pending_approval",
+                    requestIp: requestIp(req),
+                    requestingUserId:
+                      requestType === "human"
+                        ? req.actor.userId ?? "local-board"
+                        : null,
+                    requestEmailSnapshot:
+                      requestType === "human" ? actorEmail : null,
+                    agentName:
+                      requestType === "agent" ? req.body.agentName : null,
+                    adapterType: requestType === "agent" ? adapterType : null,
+                    capabilities:
+                      requestType === "agent"
+                        ? req.body.capabilities ?? null
+                        : null,
+                    agentDefaultsPayload:
+                      requestType === "agent" ? persistedJoinDefaultsPayload : null,
+                    claimSecretHash,
+                    claimSecretExpiresAt
+                  })
+                  .returning()
+                  .then((rows) => rows[0]);
+                return row;
+              })
+          : await db
+              .update(joinRequests)
+              .set({
+                requestIp: requestIp(req),
+                agentName:
+                  requestType === "agent"
+                    ? req.body.agentName ??
+                      existingJoinRequestForInvite?.agentName ??
+                      null
+                    : null,
+                capabilities:
+                  requestType === "agent"
+                    ? req.body.capabilities ??
+                      existingJoinRequestForInvite?.capabilities ??
+                      null
+                    : null,
+                adapterType: requestType === "agent" ? adapterType : null,
+                agentDefaultsPayload:
+                  requestType === "agent" ? persistedJoinDefaultsPayload : null,
+                updatedAt: new Date()
+              })
+              .where(eq(joinRequests.id, replayJoinRequestId as string))
+              .returning()
+              .then((rows) => rows[0]);
+
+        if (!created) {
+          throw conflict("Join request not found");
         }
+
+        if (
+          inviteAlreadyAccepted &&
+          requestType === "agent" &&
+          adapterType === "openclaw_gateway" &&
+          created.status === "approved" &&
+          created.createdAgentId
+        ) {
+          const existingAgent = await agentService(db, publications).getById(created.createdAgentId);
+          if (!existingAgent) {
+            throw conflict("Approved join request agent not found");
+          }
+          const existingAdapterConfig = isPlainObject(existingAgent.adapterConfig)
+            ? (existingAgent.adapterConfig as Record<string, unknown>)
+            : {};
+          const nextAdapterConfig = {
+            ...existingAdapterConfig,
+            ...(persistedJoinDefaultsPayload ?? {})
+          };
+          const updatedAgent = await agentService(db, publications).update(created.createdAgentId, {
+            adapterType,
+            adapterConfig: nextAdapterConfig
+          }, { recordRevision: { source: "join_replay", createdByUserId: req.actor.userId ?? null, createdByAgentId: req.actor.agentId ?? null } });
+          if (!updatedAgent) {
+            throw conflict("Approved join request agent not found");
+          }
+          await logActivity(db, {
+            companyId,
+            actorType: req.actor.type === "agent" ? "agent" : "user",
+            actorId:
+              req.actor.type === "agent"
+                ? req.actor.agentId ?? "invite-agent"
+                : req.actor.userId ?? "board",
+            action: "agent.updated_from_join_replay",
+            entityType: "agent",
+            entityId: updatedAgent.id,
+            details: { inviteId: invite.id, joinRequestId: created.id }
+          }, publications);
+        }
+
         await logActivity(db, {
           companyId,
           actorType: req.actor.type === "agent" ? "agent" : "user",
           actorId:
             req.actor.type === "agent"
               ? req.actor.agentId ?? "invite-agent"
-              : req.actor.userId ?? "board",
-          action: "agent.updated_from_join_replay",
-          entityType: "agent",
-          entityId: updatedAgent.id,
-          details: { inviteId: invite.id, joinRequestId: created.id }
-        });
-      }
+              : req.actor.userId ??
+                (requestType === "agent" ? "invite-anon" : "board"),
+          action: inviteAlreadyAccepted
+            ? "join.request_replayed"
+            : "join.requested",
+          entityType: "join_request",
+          entityId: created.id,
+          details: {
+            requestType,
+            requestIp: requestIp(req),
+            inviteReplay: inviteAlreadyAccepted,
+            reusedExistingJoinRequest:
+              Boolean(existingHumanJoinRequest) && !inviteAlreadyAccepted
+          }
+        }, ...(adapterType === "openclaw_gateway" ? [publications] as const : []));
+        return created;
+      };
+      let created = adapterType === "openclaw_gateway"
+        ? await db.transaction((tx) => persistAccept(tx as unknown as Db)).catch(() => {
+            throw conflict("OpenClaw invite persistence failed");
+          })
+        : await persistAccept(db);
+      if (adapterType === "openclaw_gateway") publishGatewayActivities(publications);
+      else for (const publication of publications) publishActivity(publication);
 
       if (requestType === "agent" && adapterType === "openclaw_gateway") {
         const expectedDefaults = summarizeOpenClawGatewayDefaultsForLog(
@@ -3982,7 +4034,7 @@ export function accessRoutes(
           missingPersistedFields.push("paperclipApiUrl");
         }
         if (expectedDefaults.gatewayToken && !persistedDefaults.gatewayToken) {
-          missingPersistedFields.push("headers.x-openclaw-token");
+          missingPersistedFields.push("authToken");
         }
         if (
           expectedDefaults.devicePrivateKeyPem &&
@@ -4026,27 +4078,7 @@ export function accessRoutes(
         }
       }
 
-      await logActivity(db, {
-        companyId,
-        actorType: req.actor.type === "agent" ? "agent" : "user",
-        actorId:
-          req.actor.type === "agent"
-            ? req.actor.agentId ?? "invite-agent"
-            : req.actor.userId ??
-              (requestType === "agent" ? "invite-anon" : "board"),
-        action: inviteAlreadyAccepted
-          ? "join.request_replayed"
-          : "join.requested",
-        entityType: "join_request",
-        entityId: created.id,
-        details: {
-          requestType,
-          requestIp: requestIp(req),
-          inviteReplay: inviteAlreadyAccepted,
-          reusedExistingJoinRequest:
-            Boolean(existingHumanJoinRequest) && !inviteAlreadyAccepted
-        }
-      });
+
 
       if (requestType === "human") {
         created = await approveHumanJoinRequestFromInvite({
@@ -4170,6 +4202,10 @@ export function accessRoutes(
       if (!existing) throw notFound("Join request not found");
       if (existing.status !== "pending_approval")
         throw conflict("Join request is not pending");
+      if (existing.requestType === "agent" && existing.adapterType === "openclaw_gateway") {
+        const decision = await access.decide({ actor: req.actor, action: "agent_config:update", resource: { type: "company", companyId } });
+        if (!decision.allowed) throw forbidden("Agent configuration update permission required for gateway credentials");
+      }
 
       const invite = await db
         .select()
@@ -4240,7 +4276,7 @@ export function accessRoutes(
           permissions: {},
           lastHeartbeatAt: null,
           metadata: null
-        });
+        }, existing.adapterType === "openclaw_gateway" ? { actor: { userId: req.actor.userId, agentId: req.actor.agentId } } : undefined);
         createdAgentId = created.id;
         await access.ensureMembership(
           companyId,

@@ -46,6 +46,7 @@ const mockAgentService = vi.hoisted(() => ({
   activatePendingApproval: vi.fn(),
   terminate: vi.fn(),
   update: vi.fn(),
+  updateGatewayAuthTokenBindingCas: vi.fn(),
   updatePermissions: vi.fn(),
   getChainOfCommand: vi.fn(),
   resolveByReference: vi.fn(),
@@ -311,6 +312,7 @@ describe.sequential("agent permission routes", () => {
     mockAgentService.activatePendingApproval.mockReset();
     mockAgentService.terminate.mockReset();
     mockAgentService.update.mockReset();
+    mockAgentService.updateGatewayAuthTokenBindingCas.mockReset();
     mockAgentService.updatePermissions.mockReset();
     mockAgentService.getChainOfCommand.mockReset();
     mockAgentService.resolveByReference.mockReset();
@@ -359,6 +361,16 @@ describe.sequential("agent permission routes", () => {
       activated: false,
     });
     mockAgentService.update.mockResolvedValue(baseAgent);
+    mockAgentService.updateGatewayAuthTokenBindingCas.mockResolvedValue({
+      ...baseAgent,
+      adapterType: "openclaw_gateway",
+      adapterConfig: {
+        headers: { "x-device-id": "device-1" },
+        devicePrivateKeyPem: "secret-ref-placeholder",
+        authToken: { type: "secret_ref", id: "secret-1", version: 1 },
+      },
+      updatedAt: new Date("2026-03-19T00:00:01.000Z"),
+    });
     mockAgentService.updatePermissions.mockResolvedValue(baseAgent);
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(0);
     mockAccessService.canUser.mockResolvedValue(true);
@@ -1874,6 +1886,123 @@ describe.sequential("agent permission routes", () => {
         resource: { type: "company", companyId },
       }));
     });
+  });
+
+  it("atomically binds the OpenClaw gateway token through a board-only redacted route", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/gateway-auth-token-binding`)
+      .send({
+        expectedUpdatedAt: baseAgent.updatedAt.toISOString(),
+        value: "synthetic-new-gateway-token",
+      }));
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.updateGatewayAuthTokenBindingCas).toHaveBeenCalledWith(
+      agentId,
+      {
+        expectedUpdatedAt: baseAgent.updatedAt.toISOString(),
+        value: "synthetic-new-gateway-token",
+        actor: {
+          agentId: null,
+          userId: "board-user",
+        },
+      },
+    );
+    expect(res.body).toEqual({
+      agentId,
+      updatedAt: "2026-03-19T00:00:01.000Z",
+      binding: {
+        configPath: "authToken",
+        redacted: true,
+        legacyHeaderRemoved: true,
+      },
+      preserved: {
+        headerKeys: ["x-device-id"],
+        devicePrivateKeyPresent: true,
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain("synthetic-new-gateway-token");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("requires update permission even when create permission is allowed and performs zero mutation calls on denial", async () => {
+    mockAccessService.decide.mockImplementation(async ({ action }) => ({
+      allowed: action !== "agent_config:update",
+      reason: "deny_missing_grant", explanation: "Update permission required",
+    }));
+    const app = await createApp({ type: "board", userId: "board-user", source: "session", isInstanceAdmin: false, companyIds: [companyId] });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/gateway-auth-token-binding`)
+      .send({ expectedUpdatedAt: baseAgent.updatedAt.toISOString(), value: crypto.randomUUID() }));
+    expect(res.status).toBe(403);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "agent_config:update" }));
+    expect(mockAgentService.updateGatewayAuthTokenBindingCas).not.toHaveBeenCalled();
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it.each(["authToken", "token", "password", "devicePrivateKeyPem", " X-OpenClaw-Token ", " X-OpenClaw-Auth ", " Authorization "])("denies credential-bearing creates with create-only permission: %s", async (key) => {
+    mockAccessService.decide.mockImplementation(async ({ action }) => ({ allowed: action !== "agent_config:update", reason: "deny_missing_grant", explanation: "Update permission required" }));
+    const app = await createApp({ type: "board", userId: "board-user", source: "session", isInstanceAdmin: false, companyIds: [companyId] });
+    const adapterConfig = ["authToken", "token", "password", "devicePrivateKeyPem"].includes(key) ? { [key]: crypto.randomUUID() } : { headers: { [key]: crypto.randomUUID() } };
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).post(`/api/companies/${companyId}/agents`)
+      .send({ name: "Gateway", role: "engineer", adapterType: "openclaw_gateway", adapterConfig }));
+    expect(res.status).toBe(403);
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("allows noncredential gateway creation with create-only permission", async () => {
+    mockAccessService.decide.mockImplementation(async ({ action }) => ({ allowed: action !== "agent_config:update", reason: "allow_test", explanation: "Create allowed" }));
+    const app = await createApp({ type: "board", userId: "board-user", source: "session", isInstanceAdmin: false, companyIds: [companyId] });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).post(`/api/companies/${companyId}/agents`)
+      .send({ name: "Gateway", role: "engineer", adapterType: "openclaw_gateway", adapterConfig: { url: "wss://gateway.example.invalid", disableDeviceAuth: true } }));
+    expect(res.status).toBe(201);
+    expect(mockAgentService.create).toHaveBeenCalled();
+    expect(mockAccessService.decide.mock.calls.some(([input]) => input.action === "agent_config:update")).toBe(false);
+  });
+
+  it("denies self PATCH before credential normalization when update permission is denied", async () => {
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "openclaw_gateway" });
+    mockAccessService.decide.mockResolvedValue({ allowed: false, reason: "deny_missing_grant", explanation: "Update permission required" });
+    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key" });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { headers: { " X-OPENCLAW-TOKEN ": crypto.randomUUID() } } }));
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("rejects agent-key access to the gateway token binding route", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/gateway-auth-token-binding`)
+      .send({
+        expectedUpdatedAt: baseAgent.updatedAt.toISOString(),
+        value: "synthetic-new-gateway-token",
+      }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.updateGatewayAuthTokenBindingCas).not.toHaveBeenCalled();
   });
 
   it("rejects heartbeat cancellation outside the caller company scope", async () => {

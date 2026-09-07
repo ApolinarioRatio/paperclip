@@ -504,6 +504,12 @@ export function companyRoutes(db: Db, storage?: StorageService) {
         assertImportTargetAccess(req, importBody.target);
         const activity = importedCompanyActivityContext(actor, importBody.include ?? null);
         const result = await portability.importBundle(importBody, boardUserId, {
+          actorAgentId: req.actor.agentId ?? null,
+          authorizeGatewayCredentials: async () => {
+            if (importBody.target.mode === "new_company") return;
+            const decision = await access.decide({ actor: req.actor, action: "agent_config:update", resource: { type: "company", companyId: importBody.target.companyId } });
+            if (!decision.allowed) throw forbidden("Gateway credential imports require agent_config:update permission");
+          },
           pauseAutomations: importBody.pauseAutomations === true,
         });
         await logImportedCompanyActivity(db, activity, result);
@@ -520,6 +526,12 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     assertImportTargetAccess(req, importBody.target);
     const activity = importedCompanyActivityContext(actor, importBody.include ?? null);
     const result = await portability.importBundle(importBody, boardUserId, {
+          actorAgentId: req.actor.agentId ?? null,
+          authorizeGatewayCredentials: async () => {
+            if (importBody.target.mode === "new_company") return;
+            const decision = await access.decide({ actor: req.actor, action: "agent_config:update", resource: { type: "company", companyId: importBody.target.companyId } });
+            if (!decision.allowed) throw forbidden("Gateway credential imports require agent_config:update permission");
+          },
       pauseAutomations: importBody.pauseAutomations === true,
     });
     await logImportedCompanyActivity(db, activity, result);
@@ -573,6 +585,11 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     const result = await portability.importBundle(body, req.actor.type === "board" ? req.actor.userId : null, {
       mode: "agent_safe",
       sourceCompanyId: companyId,
+      actorAgentId: req.actor.agentId ?? null,
+      authorizeGatewayCredentials: async () => {
+        const decision = await access.decide({ actor: req.actor, action: "agent_config:update", resource: { type: "company", companyId } });
+        if (!decision.allowed) throw forbidden("Gateway credential imports require agent_config:update permission");
+      },
       pauseAutomations: body.pauseAutomations === true,
     });
     await logActivity(db, {

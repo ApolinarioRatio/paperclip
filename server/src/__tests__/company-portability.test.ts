@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1879,6 +1879,86 @@ describe("company portability", () => {
 
     expect(companySvc.create).not.toHaveBeenCalled();
     expect(agentSvc.create).not.toHaveBeenCalled();
+  });
+
+  it("export and export preview redact gateway credentials from manifests and serialized files", async () => {
+    const secretId = randomUUID();
+    const value = randomUUID();
+    const rows = await agentSvc.list();
+    agentSvc.list.mockResolvedValue([{ ...rows[0], adapterType: "openclaw_gateway", adapterConfig: {
+      authToken: { type: "secret_ref", secretId, version: "latest" }, password: value, devicePrivateKeyPem: value,
+      headers: { " Authorization ": value, "X-Sibling": "keep" },
+    }, runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { authToken: { type: "secret_ref", secretId, version: "latest" } } } } } }]);
+    const service = companyPortabilityService({} as any);
+    for (const exported of [await service.exportBundle("company-1", { include: { company: true, agents: true, projects: false, issues: false } }),
+      await service.previewExport("company-1", { include: { company: true, agents: true, projects: false, issues: false } })]) {
+      const encoded = JSON.stringify(exported);
+      expect(encoded.includes(secretId) || encoded.includes(value)).toBe(false);
+      expect(encoded.includes("REDACTED")).toBe(true);
+      expect(encoded.includes("X-Sibling")).toBe(true);
+    }
+  });
+
+  it("import preview masks serialized gateway source without mutating the internal import plan", async () => {
+    const value = randomUUID();
+    const files = {
+      "COMPANY.md": "---\nname: Import\nincludes:\n  - agents/coder/AGENTS.md\n---\n",
+      "agents/coder/AGENTS.md": "---\nname: Coder\nslug: coder\nkind: agent\n---\n# Coder\n",
+      ".paperclip.yaml": ["schema: paperclip/v1", "agents:", "  coder:", "    adapter:", "      type: openclaw_gateway",
+        `      config: ${JSON.stringify({ authToken: { type: "secret_ref", secretId: value, version: "latest" } })}`,
+        `    runtime: ${JSON.stringify({ modelProfiles: { cheap: { adapterConfig: { password: value } } } })}`,
+      ].join("\n"),
+    };
+    agentSvc.list.mockResolvedValue([]);
+    const input = { source: { type: "inline" as const, expectedFileCount: 3, files }, include: { company: false, agents: true, projects: false, issues: false }, target: { mode: "existing_company" as const, companyId: "company-1" }, collisionStrategy: "rename" as const };
+    const preview = await companyPortabilityService({} as any).previewImport(input);
+    expect(JSON.stringify(preview).includes(value)).toBe(false);
+    expect(JSON.stringify(files).includes(value)).toBe(true);
+    expect(agentSvc.create).not.toHaveBeenCalled();
+  });
+
+  it("authorized gateway import/copy defers materialization to the agent transaction and attributes the agent actor", async () => {
+    const value = randomUUID();
+    agentSvc.list.mockResolvedValue([]);
+    agentSvc.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({ id: "agent-imported", name: input.name, adapterType: input.adapterType, adapterConfig: input.adapterConfig, status: input.status }));
+    const files = {
+      "COMPANY.md": "---\nname: Import\nincludes:\n  - agents/coder/AGENTS.md\n---\n",
+      "agents/coder/AGENTS.md": "---\nname: Coder\nslug: coder\nkind: agent\n---\n# Coder\n",
+      ".paperclip.yaml": "schema: paperclip/v1\nagents:\n  coder:\n    adapter:\n      type: openclaw_gateway\n      config: {}\n",
+    };
+    const authorize = vi.fn(async () => {
+      expect(agentSvc.create).not.toHaveBeenCalled();
+      expect(secretSvc.create).not.toHaveBeenCalled();
+    });
+    await companyPortabilityService({} as any).importBundle({ source: { type: "inline", expectedFileCount: 3, files }, include: { company: false, agents: true, projects: false, issues: false }, target: { mode: "existing_company", companyId: "company-1" }, collisionStrategy: "rename", adapterOverrides: { coder: { adapterType: "openclaw_gateway", adapterConfig: { authToken: value } } } }, null, { actorAgentId: "fixture-actor", authorizeGatewayCredentials: authorize });
+    expect(authorize).toHaveBeenCalledTimes(1);
+    expect(secretSvc.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+    expect(agentSvc.create.mock.calls[0]![2]).toEqual({ actor: { userId: null, agentId: "fixture-actor" } });
+    expect(agentSvc.create.mock.calls[0]![1].adapterConfig.authToken === value).toBe(true);
+    expect(agentSvc.update.mock.calls[0]![2]).toMatchObject({ recordRevision: { source: "company_import", createdByAgentId: "fixture-actor" } });
+  });
+
+  it.each(["manifest", "override", "profile"])("denies credential import before every materialization/write boundary: %s", async (source) => {
+    const value = randomUUID();
+    const files = {
+      "COMPANY.md": "---\nname: Import\nincludes:\n  - agents/coder/AGENTS.md\n---\n",
+      "agents/coder/AGENTS.md": "---\nname: Coder\nslug: coder\nkind: agent\n---\n# Coder\n",
+      ".paperclip.yaml": ["schema: paperclip/v1", "agents:", "  coder:", "    adapter:",
+        `      type: ${source === "override" ? "codex_local" : "openclaw_gateway"}`,
+        `      config: ${JSON.stringify(source === "manifest" ? { authToken: value } : {})}`,
+        `    runtime: ${JSON.stringify(source === "profile" ? { modelProfiles: { cheap: { adapterConfig: { password: value } } } } : {})}`,
+      ].join("\n"),
+    };
+    agentSvc.list.mockResolvedValue([]);
+    const authorize = vi.fn(async () => { throw Object.assign(new Error("Update permission required"), { status: 403 }); });
+    const input = { source: { type: "inline" as const, expectedFileCount: 3, files }, include: { company: true, agents: true, projects: false, issues: false },
+      target: { mode: "new_company" as const, newCompanyName: "Imported" }, collisionStrategy: "rename" as const,
+      ...(source === "override" ? { adapterOverrides: { coder: { adapterType: "openclaw_gateway", adapterConfig: { authToken: value } } } } : {}),
+    };
+    await expect(companyPortabilityService({} as any).importBundle(input, "user-1", { authorizeGatewayCredentials: authorize })).rejects.toMatchObject({ status: 403 });
+    expect(authorize).toHaveBeenCalledTimes(1);
+    for (const mutation of [companySvc.create, companySvc.update, secretSvc.create, secretSvc.normalizeAdapterConfigForPersistence,
+      secretSvc.normalizeEnvBindingsForPersistence, agentSvc.create, agentSvc.update, accessSvc.ensureMembership]) expect(mutation).not.toHaveBeenCalled();
   });
 
   it("imports an inline bundle whose file count matches the declared count", async () => {

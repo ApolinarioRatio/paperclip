@@ -138,6 +138,36 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   return sanitizeRecord(payload);
 }
 
+/** Public agent/configuration receipts expose presence, never a usable gateway reference. */
+export function redactOpenClawAgentResponse(value: unknown, fallbackAdapterType?: string): unknown {
+  if (Array.isArray(value)) return value.map((entry) => redactOpenClawAgentResponse(entry, fallbackAdapterType));
+  if (!isPlainObject(value)) return value;
+  const adapterType = typeof value.adapterType === "string" ? value.adapterType : fallbackAdapterType;
+  const result = Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactOpenClawAgentResponse(entry, adapterType)]));
+  if (adapterType !== "openclaw_gateway" || (!isPlainObject(value.adapterConfig) && !isPlainObject(value.runtimeConfig))) return result;
+  function hideReferences(entry: unknown): unknown {
+    if (Array.isArray(entry)) return entry.map(hideReferences);
+    if (!isPlainObject(entry)) return entry;
+    if (isSecretRefBinding(entry) || isUserSecretRefBinding(entry)) return REDACTED_EVENT_VALUE;
+    return Object.fromEntries(Object.entries(sanitizeRecord(entry)).map(([key, nested]) => [key, hideReferences(nested)]));
+  }
+  const config = hideReferences(value.adapterConfig ?? {}) as Record<string, unknown>;
+  for (const key of ["authToken", "token", "password", "devicePrivateKeyPem"]) {
+    if (Object.prototype.hasOwnProperty.call(config, key)) config[key] = REDACTED_EVENT_VALUE;
+  }
+  if (isPlainObject(config.headers)) {
+    if (Object.keys(config.headers).some((key) =>
+      ["x-openclaw-token", "x-openclaw-auth", "authorization"].includes(key.trim().toLowerCase()),
+    )) config.authToken = REDACTED_EVENT_VALUE;
+    config.headers = Object.fromEntries(Object.entries(config.headers).filter(([key]) =>
+      !["x-openclaw-token", "x-openclaw-auth", "authorization"].includes(key.trim().toLowerCase()),
+    ));
+  }
+  return { ...result, ...(isPlainObject(value.adapterConfig) ? { adapterConfig: config } : {}),
+    ...(isPlainObject(value.runtimeConfig) ? { runtimeConfig: hideReferences(value.runtimeConfig) } : {}),
+  };
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(

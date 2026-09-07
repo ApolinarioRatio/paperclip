@@ -26,8 +26,9 @@ import {
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
 } from "@paperclipai/shared";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
+import { logActivity, publishActivity, publishGatewayActivities, type ActivityPublication } from "./activity-log.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import { secretService } from "./secrets.js";
@@ -40,6 +41,7 @@ import {
   readBuiltInAgentMarker,
 } from "./built-in-agent-metadata.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { normalizeOpenClawRuntimeCredentials } from "./openclaw-credentials.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -75,12 +77,14 @@ interface RevisionMetadata {
 }
 
 interface UpdateAgentOptions {
+  expectedUpdatedAt?: string;
   recordRevision?: RevisionMetadata;
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
 }
 
 interface CreateAgentOptions {
+  actor?: { userId?: string | null; agentId?: string | null };
   allowBuiltInAgentMetadata?: boolean;
 }
 
@@ -96,33 +100,6 @@ interface AgentShortnameCollisionOptions {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-const LEGACY_OPENCLAW_CREDENTIAL_HEADER_KEYS = new Set([
-  "x-openclaw-token",
-  "x-openclaw-auth",
-  "authorization",
-]);
-
-function normalizeOpenClawCredentialConfig(adapterType: string, adapterConfig: Record<string, unknown>) {
-  if (adapterType !== "openclaw_gateway") return adapterConfig;
-  const headers = isPlainRecord(adapterConfig.headers) ? adapterConfig.headers : null;
-  if (!headers) return adapterConfig;
-  let legacyValue: unknown;
-  const normalizedHeaders: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(headers)) {
-    if (LEGACY_OPENCLAW_CREDENTIAL_HEADER_KEYS.has(key.trim().toLowerCase())) {
-      legacyValue ??= value;
-    } else {
-      normalizedHeaders[key] = value;
-    }
-  }
-  if (Object.keys(normalizedHeaders).length === Object.keys(headers).length) return adapterConfig;
-  return {
-    ...adapterConfig,
-    headers: normalizedHeaders,
-    ...(Object.prototype.hasOwnProperty.call(adapterConfig, "authToken") ? {} : { authToken: legacyValue }),
-  };
 }
 
 function jsonEqual(left: unknown, right: unknown): boolean {
@@ -310,8 +287,21 @@ export function deduplicateAgentName(
   return `${candidateName} ${Date.now()}`;
 }
 
-export function agentService(db: Db) {
+export function agentService(db: Db, outerPublications?: ActivityPublication[]) {
   const secretsSvc = secretService(db);
+
+  async function configTransaction<T>(work: (txDb: Db, publications: ActivityPublication[], context: { gateway: boolean }) => Promise<T>, gateway = false): Promise<T> {
+    const publications: ActivityPublication[] = [];
+    const context = { gateway };
+    const result = await db.transaction((tx) => work(tx as unknown as Db, publications, context)).catch((error: unknown) => {
+      if (context.gateway && !(error instanceof HttpError)) throw new Error("OpenClaw credential persistence failed");
+      throw error;
+    });
+    if (outerPublications) outerPublications.push(...publications);
+    else if (context.gateway) publishGatewayActivities(publications);
+    else for (const publication of publications) publishActivity(publication);
+    return result;
+  }
 
   function currentUtcMonthWindow(now = new Date()) {
     const year = now.getUTCFullYear();
@@ -494,19 +484,59 @@ export function agentService(db: Db) {
     });
   }
 
-  async function updateAgent(
+  // Historical snapshots use the same persistence boundary as current config.
+  // Called only inside the transaction holding the owning agent row lock.
+  async function scrubGatewayHistory(txDb: Db, agent: typeof agents.$inferSelect, actor: RevisionMetadata = {}) {
+    const normalizeSnapshot = async (snapshot: Record<string, unknown>) => {
+      if ((snapshot.adapterType ?? agent.adapterType) !== "openclaw_gateway") return snapshot;
+      const adapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
+        agent.companyId, isPlainRecord(snapshot.adapterConfig) ? snapshot.adapterConfig : {},
+        { adapterType: "openclaw_gateway", allowRedactedPlaceholders: true, actor: { userId: actor.createdByUserId, agentId: actor.createdByAgentId } },
+      );
+      const runtimeConfig = isPlainRecord(snapshot.runtimeConfig)
+        ? normalizeOpenClawRuntimeCredentials(snapshot.runtimeConfig, adapterConfig, true)
+        : snapshot.runtimeConfig;
+      return { ...snapshot, adapterType: "openclaw_gateway", adapterConfig, runtimeConfig };
+    };
+    const revisions = await txDb.select().from(agentConfigRevisions)
+      .where(and(eq(agentConfigRevisions.agentId, agent.id), eq(agentConfigRevisions.companyId, agent.companyId)));
+    for (const revision of revisions) {
+      const beforeConfig = await normalizeSnapshot(revision.beforeConfig);
+      const afterConfig = await normalizeSnapshot(revision.afterConfig);
+      if (!jsonEqual(beforeConfig, revision.beforeConfig) || !jsonEqual(afterConfig, revision.afterConfig)) {
+        await txDb.update(agentConfigRevisions).set({ beforeConfig, afterConfig })
+          .where(eq(agentConfigRevisions.id, revision.id));
+      }
+    }
+  }
+
+  async function updateAgentInTransaction(
+    txDb: Db,
     id: string,
     data: Partial<typeof agents.$inferInsert>,
     options?: UpdateAgentOptions,
+    publications?: ActivityPublication[],
+    context?: { gateway: boolean },
+    approvalActivation = false,
   ) {
-    const existing = await getById(id);
+    const existing = await txDb.select().from(agents).where(eq(agents.id, id)).for("update")
+      .then((rows) => rows[0] ?? null);
     if (!existing) return null;
+    if (context) context.gateway = existing.adapterType === "openclaw_gateway" || data.adapterType === "openclaw_gateway";
+    if (options?.expectedUpdatedAt !== undefined) {
+      const expected = new Date(options.expectedUpdatedAt);
+      if (Number.isNaN(expected.getTime())) throw unprocessable("expectedUpdatedAt must be an ISO timestamp");
+      if (existing.updatedAt.getTime() !== expected.getTime()) {
+        throw conflict("Agent config changed since it was read", { code: "agent_config_cas_conflict", agentId: id });
+      }
+    }
 
     if (existing.status === "terminated" && data.status && data.status !== "terminated") {
       throw conflict("Terminated agents cannot be resumed");
     }
     if (
       existing.status === "pending_approval" &&
+      !approvalActivation &&
       data.status &&
       data.status !== "pending_approval" &&
       data.status !== "terminated"
@@ -544,6 +574,44 @@ export function agentService(db: Db) {
     }
 
     const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
+    const adapterType = (normalizedPatch.adapterType ?? existing.adapterType) as string;
+    const actor = { userId: options?.recordRevision?.createdByUserId, agentId: options?.recordRevision?.createdByAgentId };
+    const scopedSecrets = secretService(txDb);
+    const safeExisting = { ...existing };
+    if (existing.adapterType === "openclaw_gateway") {
+      safeExisting.adapterConfig = await scopedSecrets.normalizeAdapterConfigForPersistence(
+        existing.companyId, existing.adapterConfig, { adapterType: existing.adapterType, actor },
+      );
+      safeExisting.runtimeConfig = normalizeOpenClawRuntimeCredentials(existing.runtimeConfig, safeExisting.adapterConfig, true);
+    }
+    if (adapterType === "openclaw_gateway" && isPlainRecord(normalizedPatch.adapterConfig)) {
+      normalizedPatch.adapterConfig = { ...normalizedPatch.adapterConfig };
+      for (const key of ["authToken", "password", "devicePrivateKeyPem"]) {
+        if (Object.prototype.hasOwnProperty.call(normalizedPatch.adapterConfig, key)
+          && JSON.stringify(normalizedPatch.adapterConfig[key]) === JSON.stringify(existing.adapterConfig[key])) {
+          normalizedPatch.adapterConfig[key] = safeExisting.adapterConfig[key];
+        }
+      }
+      const preservePlaceholder = (next: unknown, prior: unknown): unknown => {
+        if (next === REDACTED_EVENT_VALUE) {
+          if (prior === undefined || prior === REDACTED_EVENT_VALUE) throw unprocessable("No existing gateway credential to preserve");
+          return prior;
+        }
+        if (!isPlainRecord(next)) return next;
+        const previous = isPlainRecord(prior) ? prior : {};
+        return Object.fromEntries(Object.entries(next).map(([key, value]) => [key, preservePlaceholder(value, previous[key])]));
+      };
+      normalizedPatch.adapterConfig = preservePlaceholder(normalizedPatch.adapterConfig, safeExisting.adapterConfig) as Record<string, unknown>;
+    }
+    if ((adapterType === "openclaw_gateway" || existing.adapterType === "openclaw_gateway") && !Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
+      normalizedPatch.adapterConfig = { ...safeExisting.adapterConfig };
+      if (existing.adapterType === "openclaw_gateway" && adapterType !== "openclaw_gateway") {
+        // Gateway-only bindings must not become public non-gateway config on a
+        // type-only switch. Retain managed secrets and the secure before snapshot
+        // for rollback; unrelated adapter-agnostic fields stay intact.
+        for (const key of ["authToken", "token", "password", "devicePrivateKeyPem"]) delete normalizedPatch.adapterConfig[key];
+      }
+    }
     if (data.permissions !== undefined) {
       const role = (data.role ?? existing.role) as string;
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions, role);
@@ -552,19 +620,24 @@ export function agentService(db: Db) {
       Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
       isPlainRecord(normalizedPatch.adapterConfig)
     ) {
-      normalizedPatch.adapterConfig = normalizeOpenClawCredentialConfig(
-        (normalizedPatch.adapterType ?? existing.adapterType) as string,
-        normalizedPatch.adapterConfig,
-      );
-      normalizedPatch.adapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+      normalizedPatch.adapterConfig = await scopedSecrets.normalizeAdapterConfigForPersistence(
         existing.companyId,
         normalizedPatch.adapterConfig,
-        { adapterType: (normalizedPatch.adapterType ?? existing.adapterType) as string },
+        { adapterType, actor },
       );
+    }
+    if (adapterType === "openclaw_gateway") {
+      normalizedPatch.runtimeConfig = normalizeOpenClawRuntimeCredentials(
+        isPlainRecord(normalizedPatch.runtimeConfig) ? normalizedPatch.runtimeConfig : safeExisting.runtimeConfig,
+        normalizedPatch.adapterConfig ?? {},
+      );
+    } else if (existing.adapterType === "openclaw_gateway" && !Object.prototype.hasOwnProperty.call(normalizedPatch, "runtimeConfig")) {
+      normalizedPatch.runtimeConfig = safeExisting.runtimeConfig;
     }
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
-    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
+    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(safeExisting) : null;
+    await scrubGatewayHistory(txDb, existing, options?.recordRevision);
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
@@ -579,7 +652,7 @@ export function agentService(db: Db) {
       }
       const updated = await txDb
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: new Date() })
+        .set({ ...normalizedPatch, updatedAt: new Date(Math.max(Date.now(), existing.updatedAt.getTime() + 1)) })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -615,11 +688,11 @@ export function agentService(db: Db) {
       return normalizedUpdated;
     };
 
-    const transaction = (db as unknown as {
-      transaction?: (callback: (tx: unknown) => Promise<AgentUpdateResult>) => Promise<AgentUpdateResult>;
-    }).transaction;
-    if (typeof transaction !== "function") return applyUpdate(db);
-    return transaction.call(db, async (tx) => applyUpdate(tx as unknown as Db));
+    return applyUpdate(txDb);
+  }
+
+  async function updateAgent(id: string, data: Partial<typeof agents.$inferInsert>, options?: UpdateAgentOptions) {
+    return configTransaction((txDb, publications, context) => updateAgentInTransaction(txDb, id, data, options, publications, context));
   }
 
   return {
@@ -654,15 +727,13 @@ export function agentService(db: Db) {
       const normalizedPermissions = normalizeAgentPermissions(data.permissions, role);
       const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
       const adapterType = data.adapterType ?? "process";
-      const adapterConfig = isPlainRecord(data.adapterConfig)
-        ? await secretsSvc.normalizeAdapterConfigForPersistence(
-            companyId,
-            normalizeOpenClawCredentialConfig(adapterType, data.adapterConfig),
-            { adapterType },
-          )
-        : {};
-      return db.transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
+      return configTransaction(async (txDb, publications) => {
+        const tx = txDb;
+        const adapterConfig = isPlainRecord(data.adapterConfig)
+          ? await secretService(txDb).normalizeAdapterConfigForPersistence(
+              companyId, data.adapterConfig, { adapterType, actor: options?.actor },
+            )
+          : {};
         const created = await tx
           .insert(agents)
           .values({
@@ -673,7 +744,8 @@ export function agentService(db: Db) {
             adapterType,
             adapterConfig,
             permissions: normalizedPermissions,
-            runtimeConfig,
+            runtimeConfig: adapterType === "openclaw_gateway"
+              ? normalizeOpenClawRuntimeCredentials(runtimeConfig, adapterConfig) : runtimeConfig,
           })
           .returning()
           .then((rows) => rows[0]);
@@ -683,10 +755,49 @@ export function agentService(db: Db) {
           throw notFound("Agent not found");
         }
         return normalizedCreated;
-      });
+      }, adapterType === "openclaw_gateway");
     },
 
     update: updateAgent,
+
+    updateGatewayAuthTokenBindingCas: async (
+      id: string,
+      input: { expectedUpdatedAt: string; value: string; actor: { agentId?: string | null; userId?: string | null } },
+    ) => {
+      if (Number.isNaN(new Date(input.expectedUpdatedAt).getTime())) {
+        throw unprocessable("expectedUpdatedAt must be an ISO timestamp");
+      }
+      if (!input.value.trim()) throw unprocessable("Gateway auth token value is required");
+      return configTransaction(async (txDb, publications) => {
+        const existing = await txDb.select().from(agents).where(eq(agents.id, id)).for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return null;
+        if (existing.adapterType !== "openclaw_gateway") {
+          throw unprocessable("Agent is not configured with the OpenClaw Gateway adapter");
+        }
+        const updated = await updateAgentInTransaction(txDb, id, {
+          adapterConfig: { ...existing.adapterConfig, authToken: input.value },
+        }, {
+          expectedUpdatedAt: input.expectedUpdatedAt,
+          recordRevision: {
+            createdByAgentId: input.actor.agentId,
+            createdByUserId: input.actor.userId,
+            source: "gateway_auth_token_binding_cas",
+          },
+        }, publications);
+        if (!updated) throw notFound("Agent not found");
+        await logActivity(txDb, {
+          companyId: existing.companyId,
+          actorType: input.actor.userId ? "user" : input.actor.agentId ? "agent" : "system",
+          actorId: input.actor.userId ?? input.actor.agentId ?? "system",
+          agentId: input.actor.agentId ?? null,
+          action: "agent.gateway_auth_token_bound",
+          entityType: "agent", entityId: id,
+          details: { bindingConfigPath: "authToken", legacyHeaderRemoved: true },
+        }, publications);
+        return updated;
+      }, true);
+    },
 
     pause: async (id: string, reason: "manual" | "budget" | "system" = "manual") => {
       const existing = await getById(id);
@@ -844,25 +955,32 @@ export function agentService(db: Db) {
       });
     },
 
-    activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {
-      const activatedAgent = await db.transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
-        const existing = await agentService(txDb).getById(id);
+    activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null, actor?: { userId?: string | null; agentId?: string | null }) => {
+      const activatedAgent = await configTransaction(async (txDb, publications, context) => {
+        const tx = txDb;
+        const existing = await txDb.select().from(agents).where(eq(agents.id, id)).for("update")
+          .then((rows) => rows[0] ?? null);
         if (!existing || existing.status !== "pending_approval") return null;
+        context.gateway = existing.adapterType === "openclaw_gateway" || approvedPayload?.adapterType === "openclaw_gateway";
         const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
         let patch = { ...approvedPatch } as Partial<typeof agents.$inferInsert>;
+        if (context.gateway) {
+          return updateAgentInTransaction(txDb, id, { ...patch, status: "idle" }, {
+            allowPendingApprovalConfigUpdate: true,
+            recordRevision: { source: "approval_activation", createdByUserId: actor?.userId, createdByAgentId: actor?.agentId },
+          }, publications, context, true);
+        }
+        if (existing.adapterType === "openclaw_gateway" || patch.adapterType === "openclaw_gateway") {
+          patch.adapterConfig ??= existing.adapterConfig;
+        }
         if (
           Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&
           isPlainRecord(patch.adapterConfig)
         ) {
-          patch.adapterConfig = normalizeOpenClawCredentialConfig(
-            (patch.adapterType ?? existing.adapterType) as string,
-            patch.adapterConfig,
-          );
           patch.adapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
             existing.companyId,
             patch.adapterConfig,
-            { adapterType: (patch.adapterType ?? existing.adapterType) as string },
+            { adapterType: (patch.adapterType ?? existing.adapterType) as string, actor },
           );
         }
         if (patch.permissions !== undefined) {
@@ -871,6 +989,14 @@ export function agentService(db: Db) {
             (patch.role ?? existing.role) as string,
           );
         }
+        if ((patch.adapterType ?? existing.adapterType) === "openclaw_gateway") {
+          patch.runtimeConfig = normalizeOpenClawRuntimeCredentials(
+            isPlainRecord(patch.runtimeConfig) ? patch.runtimeConfig : existing.runtimeConfig,
+            patch.adapterConfig ?? {},
+          );
+        }
+        const revisionActor = { createdByUserId: actor?.userId, createdByAgentId: actor?.agentId };
+        await scrubGatewayHistory(txDb, existing, revisionActor);
         const updated = await tx
           .update(agents)
           .set({ ...patch, status: "idle", updatedAt: new Date() })

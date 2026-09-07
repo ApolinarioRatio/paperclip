@@ -65,6 +65,7 @@ import { isSecretProviderClientError } from "../secrets/types.js";
 import { authorizationDeniedDetails, authorizationService } from "./authorization.js";
 import { findActiveServerAdapter } from "../adapters/index.js";
 import { logActivity } from "./activity-log.js";
+import { isOpenClawCredentialHeader, normalizeOpenClawRuntimeCredentials } from "./openclaw-credentials.js";
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const AGENT_ACCESS_CONFIG_PATH_PREFIX = "access.";
@@ -77,7 +78,9 @@ const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
 ]);
 const FALLBACK_ADAPTER_SCHEMA_SECRET_FIELDS: Readonly<Record<string, readonly string[]>> = {
   hermes_gateway: ["apiKey"],
+  openclaw_gateway: ["authToken", "password", "devicePrivateKeyPem"],
 };
+
 const USER_SECRET_DEFINITION_KEY_UNIQUE_CONSTRAINT = "user_secret_definitions_company_key_uq";
 const USER_SECRET_VALUE_UNIQUE_CONSTRAINT = "company_secrets_user_definition_owner_uq";
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -703,11 +706,13 @@ export function secretService(db: Db) {
   type NormalizeEnvOptions = {
     strictMode?: boolean;
     fieldPath?: string;
+    allowRedactedPlaceholders?: boolean;
   };
   type NormalizeAdapterConfigOptions = {
     strictMode?: boolean;
     adapterType?: string | null;
     actor?: { userId?: string | null; agentId?: string | null };
+    allowRedactedPlaceholders?: boolean;
   };
 
   async function getById(id: string, source: Pick<Db | DbTransaction, "select"> = db) {
@@ -1566,6 +1571,10 @@ export function secretService(db: Db) {
 
       const binding = canonicalizeBinding(parsed.data as EnvBinding);
       if (binding.type === "plain") {
+        if (opts?.allowRedactedPlaceholders && binding.value === REDACTED_SENTINEL) {
+          normalized[key] = binding;
+          continue;
+        }
         if (opts?.strictMode && isSensitiveEnvKey(key) && binding.value.trim().length > 0) {
           throw unprocessable(
             `Strict secret mode requires secret references for sensitive key: ${key}`,
@@ -1599,6 +1608,39 @@ export function secretService(db: Db) {
     adapterConfig: Record<string, unknown>,
     opts?: NormalizeAdapterConfigOptions,
   ) {
+    // This is the persistence boundary shared by agent writes, imports and
+    // join defaults. Legacy headers are input only; canonical authToken wins.
+    if (opts?.adapterType === "openclaw_gateway") {
+      if (Object.prototype.hasOwnProperty.call(adapterConfig, "token")) {
+        const { token, ...rest } = adapterConfig;
+        adapterConfig = { ...rest, ...(Object.prototype.hasOwnProperty.call(rest, "authToken") ? {} : { authToken: token }) };
+      }
+      const headers = asRecord(adapterConfig.headers);
+      if (headers) {
+        const remaining: Record<string, unknown> = {};
+        let legacyValue: unknown;
+        for (const [key, value] of Object.entries(headers)) {
+          const name = key.trim().toLowerCase();
+          if (isOpenClawCredentialHeader(name)) {
+            if (value !== REDACTED_SENTINEL && asRecord(value)?.value !== REDACTED_SENTINEL) {
+              const wrapper = asRecord(value);
+              const inputValue = wrapper && !wrapper.type && typeof wrapper.value === "string" ? wrapper.value : value;
+              legacyValue ??= name === "authorization" && typeof inputValue === "string"
+                ? inputValue.trim().replace(/^bearer\s+/i, "")
+                : inputValue;
+            }
+          } else {
+            remaining[key] = value;
+          }
+        }
+        adapterConfig = {
+          ...adapterConfig,
+          headers: remaining,
+          ...(Object.prototype.hasOwnProperty.call(adapterConfig, "authToken")
+            ? {} : { authToken: legacyValue }),
+        };
+      }
+    }
     const normalized = { ...adapterConfig };
     if (Object.prototype.hasOwnProperty.call(adapterConfig, "env")) {
       normalized.env = await normalizeEnvConfig(companyId, adapterConfig.env, opts);
@@ -1606,6 +1648,10 @@ export function secretService(db: Db) {
     const secretFieldKeys = await listAdapterSchemaSecretFieldKeys(opts?.adapterType);
     for (const key of secretFieldKeys) {
       if (!Object.prototype.hasOwnProperty.call(adapterConfig, key)) continue;
+      if (opts?.allowRedactedPlaceholders && (adapterConfig[key] === REDACTED_SENTINEL || asRecord(adapterConfig[key])?.value === REDACTED_SENTINEL)) {
+        normalized[key] = REDACTED_SENTINEL;
+        continue;
+      }
       const value = await normalizeSchemaSecretFieldForPersistence(companyId, {
         adapterType: opts?.adapterType ?? null,
         key,
@@ -4329,13 +4375,17 @@ export function secretService(db: Db) {
       opts?: NormalizeAdapterConfigOptions,
     ) => {
       const normalized = { ...payload };
+      if ((payload.adapterType ?? opts?.adapterType) === "openclaw_gateway") normalized.adapterType = "openclaw_gateway";
       const adapterConfig = asRecord(payload.adapterConfig);
       if (adapterConfig) {
         normalized.adapterConfig = await normalizeAdapterConfigForPersistenceInternal(
           companyId,
           adapterConfig,
-          opts,
+          { ...opts, adapterType: typeof payload.adapterType === "string" ? payload.adapterType : opts?.adapterType },
         );
+      }
+      if ((payload.adapterType ?? opts?.adapterType) === "openclaw_gateway" && asRecord(payload.runtimeConfig)) {
+        normalized.runtimeConfig = normalizeOpenClawRuntimeCredentials(asRecord(payload.runtimeConfig)!, asRecord(normalized.adapterConfig) ?? {});
       }
       return normalized;
     },

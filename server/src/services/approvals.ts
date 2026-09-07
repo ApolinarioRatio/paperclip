@@ -1,15 +1,20 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { HttpError, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
+import { secretService } from "./secrets.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
-export function approvalService(db: Db) {
-  const agentsSvc = agentService(db);
+import { publishGatewayActivities, type ActivityPublication } from "./activity-log.js";
+
+type ApprovalTransaction = { notificationDb: Db; publications: ActivityPublication[]; afterCommit: Array<() => void> };
+
+export function approvalService(db: Db, transaction?: ApprovalTransaction) {
+  const agentsSvc = agentService(db, transaction?.publications);
   const budgets = budgetService(db);
   const instanceSettings = instanceSettingsService(db);
   const canResolveStatuses = new Set(["pending", "revision_requested"]);
@@ -46,8 +51,9 @@ export function approvalService(db: Db) {
     targetStatus: "approved" | "rejected",
     decidedByUserId: string,
     decisionNote: string | null | undefined,
+    prior?: ApprovalRecord,
   ): Promise<ResolutionResult> {
-    const existing = await getExistingApproval(id);
+    const existing = prior ?? await getExistingApproval(id);
     if (!canResolveStatuses.has(existing.status)) {
       if (existing.status === targetStatus) {
         return { approval: existing, applied: false };
@@ -114,12 +120,23 @@ export function approvalService(db: Db) {
       return rows[0] ?? null;
     },
 
-    create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
-        .insert(approvals)
-        .values({ ...data, companyId })
-        .returning()
-        .then((rows) => rows[0]),
+    create: async (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) => {
+      const payload = data.payload as Record<string, unknown>;
+      const payloadAgent = data.type === "hire_agent" && payload.adapterType === undefined && typeof payload.agentId === "string"
+        ? await agentsSvc.getById(payload.agentId) : null;
+      const gateway = data.type === "hire_agent" && (payload.adapterType ?? payloadAgent?.adapterType) === "openclaw_gateway";
+      const persist = async (scopedDb: Db) => {
+        const normalizedPayload = gateway ? await secretService(scopedDb).normalizeHireApprovalPayloadForPersistence(companyId, payload, {
+          adapterType: "openclaw_gateway", actor: { userId: data.requestedByUserId, agentId: data.requestedByAgentId },
+        }) : payload;
+        return scopedDb.insert(approvals).values({ ...data, payload: normalizedPayload, companyId }).returning().then((rows) => rows[0]);
+      };
+      if (!gateway) return persist(db);
+      return db.transaction((tx) => persist(tx as unknown as Db)).catch((error: unknown) => {
+        if (error instanceof HttpError) throw error;
+        throw new Error("OpenClaw approval persistence failed");
+      });
+    },
 
     // Cancel an open (pending/revision_requested) approval without a board
     // decision — e.g. when its paired agent is terminated during duplicate
@@ -140,21 +157,47 @@ export function approvalService(db: Db) {
       return updated;
     },
 
-    approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
+    approve: async (id: string, decidedByUserId: string, decisionNote?: string | null): Promise<ResolutionResult> => {
+      let prior: ApprovalRecord | undefined;
+      if (!transaction) {
+        const candidate = await getExistingApproval(id);
+        prior = candidate;
+        const payload = candidate.payload as Record<string, unknown>;
+        const pendingAgent = candidate.type === "hire_agent" && typeof payload.agentId === "string"
+          ? await agentsSvc.getById(payload.agentId) : null;
+        if (candidate.type === "hire_agent" && (payload.adapterType === "openclaw_gateway" || pendingAgent?.adapterType === "openclaw_gateway")) {
+          const context: ApprovalTransaction = { notificationDb: db, publications: [], afterCommit: [] };
+          const result = await db.transaction((tx) => approvalService(tx as unknown as Db, context).approve(id, decidedByUserId, decisionNote))
+            .catch((error: unknown) => {
+              if (error instanceof HttpError) throw error;
+              throw new Error("OpenClaw approval persistence failed");
+            });
+          publishGatewayActivities(context.publications);
+          for (const notify of context.afterCommit) notify();
+          return result;
+        }
+      }
       const { approval: updated, applied } = await resolveApproval(
         id,
         "approved",
         decidedByUserId,
         decisionNote,
+        prior,
       );
 
       let hireApprovedAgentId: string | null = null;
       const now = new Date();
       if (applied && updated.type === "hire_agent") {
+        if (transaction) {
+          updated.payload = await secretService(db).normalizeHireApprovalPayloadForPersistence(updated.companyId, updated.payload, {
+            adapterType: "openclaw_gateway", actor: { userId: decidedByUserId },
+          });
+          await db.update(approvals).set({ payload: updated.payload }).where(eq(approvals.id, updated.id));
+        }
         const payload = updated.payload as Record<string, unknown>;
         const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
         if (payloadAgentId) {
-          await agentsSvc.activatePendingApproval(payloadAgentId, payload);
+          await agentsSvc.activatePendingApproval(payloadAgentId, payload, { userId: decidedByUserId });
           await reconcileApprovedBuiltInAgent(updated.companyId, payload);
           hireApprovedAgentId = payloadAgentId;
         } else {
@@ -179,7 +222,8 @@ export function approvalService(db: Db) {
             spentMonthlyCents: 0,
             permissions: undefined,
             lastHeartbeatAt: null,
-          });
+            runtimeConfig: typeof payload.runtimeConfig === "object" && payload.runtimeConfig !== null ? payload.runtimeConfig as Record<string, unknown> : {},
+          }, ...(payload.adapterType === "openclaw_gateway" ? [{ actor: { userId: decidedByUserId } }] as const : []));
           hireApprovedAgentId = created?.id ?? null;
         }
         if (hireApprovedAgentId) {
@@ -197,13 +241,16 @@ export function approvalService(db: Db) {
               decidedByUserId,
             );
           }
-          void notifyHireApproved(db, {
+          const approvedAgentId = hireApprovedAgentId;
+          const notify = () => { void notifyHireApproved(transaction?.notificationDb ?? db, {
             companyId: updated.companyId,
-            agentId: hireApprovedAgentId,
+            agentId: approvedAgentId,
             source: "approval",
             sourceId: id,
             approvedAt: now,
-          }).catch(() => {});
+          }).catch(() => {}); };
+          if (transaction) transaction.afterCommit.push(notify);
+          else notify();
         }
       }
 
@@ -250,26 +297,30 @@ export function approvalService(db: Db) {
         .then((rows) => rows[0]);
     },
 
-    resubmit: async (id: string, payload?: Record<string, unknown>) => {
+    resubmit: async (id: string, payload?: Record<string, unknown>, actor?: { userId?: string | null; agentId?: string | null }) => {
       const existing = await getExistingApproval(id);
       if (existing.status !== "revision_requested") {
         throw unprocessable("Only revision requested approvals can be resubmitted");
       }
 
-      const now = new Date();
-      return db
-        .update(approvals)
-        .set({
-          status: "pending",
-          payload: payload ?? existing.payload,
-          decisionNote: null,
-          decidedByUserId: null,
-          decidedAt: null,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]);
+      const adapterType = payload?.adapterType ?? existing.payload.adapterType;
+      const linkedAgentId = payload?.agentId ?? existing.payload.agentId;
+      const linkedAgent = existing.type === "hire_agent" && adapterType === undefined && typeof linkedAgentId === "string"
+        ? await agentsSvc.getById(linkedAgentId) : null;
+      const gateway = existing.type === "hire_agent" && (adapterType ?? linkedAgent?.adapterType) === "openclaw_gateway";
+      const persist = async (scopedDb: Db) => {
+        const normalizedPayload = gateway ? await secretService(scopedDb).normalizeHireApprovalPayloadForPersistence(existing.companyId, payload ?? existing.payload, {
+          adapterType: "openclaw_gateway", actor: actor ?? { userId: existing.requestedByUserId, agentId: existing.requestedByAgentId },
+        }) : payload ?? existing.payload;
+        return scopedDb.update(approvals).set({
+          status: "pending", payload: normalizedPayload, decisionNote: null, decidedByUserId: null, decidedAt: null, updatedAt: new Date(),
+        }).where(eq(approvals.id, id)).returning().then((rows) => rows[0]);
+      };
+      if (!gateway) return persist(db);
+      return db.transaction((tx) => persist(tx as unknown as Db)).catch((error: unknown) => {
+        if (error instanceof HttpError) throw error;
+        throw new Error("OpenClaw approval persistence failed");
+      });
     },
 
     listComments: async (approvalId: string) => {

@@ -35,7 +35,7 @@ describe("buildOpenClawGatewayConfig", () => {
       headersJson: JSON.stringify({ " X-OpenClaw-Token ": "fixture-legacy-token" }),
     });
 
-    expect(config.headers).toEqual({ "x-openclaw-token": "fixture-canonical-token" });
+    expect(config.headers).toBeUndefined();
   });
 
   it("applies the documented timeout defaults when unset (timeoutSec=120, waitTimeoutMs=120000)", () => {

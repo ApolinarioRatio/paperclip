@@ -35,6 +35,9 @@ const SENSITIVE_KEYS = new Set<string>([
   "authorization",
   "auth_token",
   "authtoken",
+  "x-openclaw-token",
+  "x-openclaw-auth",
+  "deviceprivatekeypem",
   "session_token",
   "sessiontoken",
   "private_key",
@@ -56,7 +59,7 @@ const URLISH_KEYS = new Set<string>([
 ]);
 
 function isSensitiveKey(key: string): boolean {
-  return SENSITIVE_KEYS.has(key.toLowerCase());
+  return SENSITIVE_KEYS.has(key.trim().toLowerCase());
 }
 
 function isUrlishKey(key: string): boolean {
@@ -77,16 +80,18 @@ function stripSecretBearingUrlParts(value: string): string {
   }
 }
 
-export function redactSensitive(value: unknown, depth = 0): unknown {
+export function redactSensitive(value: unknown, depth = 0, adapterConfigContext = false): unknown {
   if (depth > MAX_DEPTH) return undefined;
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
     if (depth + 1 > MAX_DEPTH) return undefined;
-    return value.map((entry) => redactSensitive(entry, depth + 1));
+    return value.map((entry) => redactSensitive(entry, depth + 1, adapterConfigContext));
   }
+  const record = value as Record<string, unknown>;
+  if (record.type === "secret_ref" || record.type === "user_secret_ref") return REDACTED;
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (isSensitiveKey(key)) {
+    if (isSensitiveKey(key) || (adapterConfigContext && key === "token") || (key === "value" && Object.prototype.hasOwnProperty.call(value, "expectedUpdatedAt"))) {
       out[key] = REDACTED;
       continue;
     }
@@ -94,7 +99,16 @@ export function redactSensitive(value: unknown, depth = 0): unknown {
       out[key] = stripSecretBearingUrlParts(entry);
       continue;
     }
-    out[key] = redactSensitive(entry, depth + 1);
+    out[key] = redactSensitive(entry, depth + 1, adapterConfigContext || key === "adapterConfig");
   }
   return out;
+}
+
+/** Invalid CAS bodies can omit the timestamp; the route still makes value sensitive. */
+export function redactHttpRequestBody(value: unknown, requestUrl: string): unknown {
+  if (/\/agents\/[^/]+\/gateway-auth-token-binding\/?(?:\?|$)/.test(requestUrl)
+    && value && typeof value === "object" && !Array.isArray(value)) {
+    return redactSensitive({ ...value, value: REDACTED });
+  }
+  return redactSensitive(value);
 }

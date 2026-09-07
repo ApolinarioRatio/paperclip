@@ -43,7 +43,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(actorOverrides: Record<string, unknown> = {}) {
+async function createApp(actorOverrides: Record<string, unknown> = {}, linkedAdapterType?: string) {
   const [{ errorHandler }, { approvalRoutes }] = await Promise.all([
     import("../middleware/index.js"),
     import("../routes/approvals.js"),
@@ -61,13 +61,14 @@ async function createApp(actorOverrides: Record<string, unknown> = {}) {
     };
     next();
   });
-  app.use("/api", approvalRoutes(createRouteDb()));
+  app.use("/api", approvalRoutes(createRouteDb({}, "run-1", "agent-1", linkedAdapterType)));
   app.use(errorHandler);
   return app;
 }
 
-function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "run-1", agentId = "agent-1") {
+function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "run-1", agentId = "agent-1", linkedAdapterType?: string) {
   const runRows = [{
+    adapterType: linkedAdapterType,
     id: runId,
     companyId: "company-1",
     agentId,
@@ -78,7 +79,7 @@ function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "r
       from: vi.fn(() => ({
         where: vi.fn(() => ({
           then: async (resolve: (rows: unknown[]) => unknown) => resolve(
-            Object.keys(selection).includes("contextSnapshot") ? runRows : [],
+            Object.keys(selection).some((key) => key === "contextSnapshot" || key === "adapterType") ? runRows : [],
           ),
         })),
       })),
@@ -142,6 +143,39 @@ describe("approval routes idempotent retries", () => {
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
     mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  it.each([true, false])("denies legacy type-omitted gateway resubmit before every write (incoming payload: %s)", async (incoming) => {
+    const payload = { agentId: "agent-1", adapterConfig: { authToken: crypto.randomUUID() } };
+    mockApprovalService.getById.mockResolvedValue({ id: "approval-1", companyId: "company-1", type: "hire_agent", status: "revision_requested", payload });
+    mockAccessService.decide.mockImplementation(async ({ action }) => ({ allowed: action !== "agent_config:update", reason: "deny_missing_grant" }));
+    const app = await createApp();
+    const response = await request(app).post("/api/approvals/approval-1/resubmit").send(incoming ? { payload } : {});
+    expect(response.status).toBe(403);
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeHireApprovalPayloadForPersistence).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("denies a type-only approval switch of a linked gateway without update authority", async () => {
+    mockApprovalService.getById.mockResolvedValue({ id: "approval-1", companyId: "company-1", type: "hire_agent", status: "pending", payload: { adapterType: "process", agentId: "agent-1" } });
+    mockAccessService.decide.mockImplementation(async ({ action }) => ({ allowed: action !== "agent_config:update", reason: "deny_missing_grant" }));
+    const response = await request(await createApp({}, "openclaw_gateway")).post("/api/approvals/approval-1/approve").send({});
+    expect(response.status).toBe(403);
+    expect(mockApprovalService.approve).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeHireApprovalPayloadForPersistence).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("denies gateway activation before approval or credential mutations for a create-only actor", async () => {
+    mockApprovalService.getById.mockResolvedValue({ id: "approval-1", companyId: "company-1", type: "hire_agent", status: "pending", payload: { adapterType: "openclaw_gateway", agentId: "agent-1" } });
+    mockAccessService.decide.mockImplementation(async ({ action }) => ({ allowed: action !== "agent_config:update", reason: "deny_missing_grant", explanation: "Update permission required" }));
+    const app = await createApp();
+    const response = await request(app).post("/api/approvals/approval-1/approve").send({});
+    expect(response.status).toBe(403);
+    expect(mockApprovalService.approve).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeHireApprovalPayloadForPersistence).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it("does not emit duplicate approval side effects when approve is already resolved", async () => {

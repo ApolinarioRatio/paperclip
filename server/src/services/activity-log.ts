@@ -227,3 +227,14 @@ export async function logActivity(
   }
   return activity;
 }
+
+/** Committed gateway mutations must not become failed receipts if a listener throws. */
+export function publishGatewayActivities(publications: ActivityPublication[]) {
+  for (const publication of publications) {
+    try {
+      publishActivity(publication);
+    } catch {
+      logger.warn("Committed gateway activity could not be published");
+    }
+  }
+}

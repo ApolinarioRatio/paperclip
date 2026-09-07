@@ -27,6 +27,7 @@ import {
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
+  gatewayAuthTokenBindingSchema,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
 } from "@paperclipai/shared";
@@ -75,6 +76,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { secretService } from "../services/secrets.js";
+import { hasOpenClawCredentialInput } from "../services/openclaw-credentials.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import {
   detectAdapterModel,
@@ -85,7 +87,7 @@ import {
   refreshAdapterModels,
   requireServerAdapter,
 } from "../adapters/index.js";
-import { redactEventPayload } from "../redaction.js";
+import { redactEventPayload, redactOpenClawAgentResponse } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import {
@@ -214,6 +216,11 @@ export function agentRoutes(
   const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
 
   const router = Router();
+  router.use((_req, res, next) => {
+    const json = res.json.bind(res);
+    res.json = (body) => json(redactOpenClawAgentResponse(body));
+    next();
+  });
   const svc = agentService(db);
   const access = accessService(db);
   const approvalsSvc = approvalService(db);
@@ -947,6 +954,13 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
+  async function assertCanCreateGatewayCredentials(req: Request, companyId: string, adapterType: unknown, config: unknown, runtimeConfig: unknown) {
+    if (!hasOpenClawCredentialInput(adapterType, config)
+      && !listRuntimeModelProfileAdapterConfigs(runtimeConfig).some((entry) => hasOpenClawCredentialInput(adapterType, entry.adapterConfig))) return;
+    const decision = await access.decide({ actor: req.actor, action: "agent_config:update", resource: { type: "company", companyId } });
+    if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
   async function assertCanReadAgent(req: Request, targetAgent: { id: string; companyId: string }) {
     if (!hasCompanyAccess(req, targetAgent.companyId)) {
       throw notFound("Agent not found");
@@ -1241,7 +1255,9 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
   }): Promise<Record<string, unknown>> {
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+    // Gateway materialization belongs to the agent write transaction (including
+    // actor attribution and history scrub), not this preflight constraint pass.
+    const normalizedAdapterConfig = input.adapterType === "openclaw_gateway" ? input.adapterConfig : await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
       input.adapterConfig,
       {
@@ -1521,7 +1537,8 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
-  async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
+  async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string; adapterType?: string }) {
+    if (targetAgent.adapterType === "openclaw_gateway") await assertCanUpdateAgent(req, targetAgent);
     await assertCanApplyProtectedAgentChange(
       req,
       targetAgent,
@@ -1872,7 +1889,10 @@ export function agentRoutes(
         typeof req.body?.environmentId === "string" && req.body.environmentId.trim().length > 0
           ? (req.body.environmentId as string)
           : null;
-      const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+      await assertCanCreateGatewayCredentials(req, companyId, type, inputAdapterConfig, null);
+      // A prospective gateway probe is read-only: do not materialize managed
+      // credentials merely to test a configuration that may never be saved.
+      const normalizedAdapterConfig = type === "openclaw_gateway" ? inputAdapterConfig : await secretsSvc.normalizeAdapterConfigForPersistence(
         companyId,
         inputAdapterConfig,
         { strictMode: strictSecretsMode, adapterType: type },
@@ -2419,7 +2439,7 @@ export function agentRoutes(
     }
     await assertCanReadConfigurations(req, agent.companyId);
     const revisions = await svc.listConfigRevisions(id);
-    res.json(revisions.map((revision) => redactConfigRevision(revision)));
+    res.json(redactOpenClawAgentResponse(revisions.map((revision) => redactConfigRevision(revision)), agent.adapterType));
   });
 
   router.get("/agents/:id/config-revisions/:revisionId", async (req, res) => {
@@ -2436,7 +2456,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Revision not found" });
       return;
     }
-    res.json(redactConfigRevision(revision));
+    res.json(redactOpenClawAgentResponse(redactConfigRevision(revision), agent.adapterType));
   });
 
   router.post("/agents/:id/config-revisions/:revisionId/rollback", async (req, res) => {
@@ -2538,6 +2558,7 @@ export function agentRoutes(
     } = req.body;
     hireInput.adapterType = assertKnownAdapterType(hireInput.adapterType);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
+    await assertCanCreateGatewayCredentials(req, companyId, hireInput.adapterType, rawHireAdapterConfig, hireInput.runtimeConfig);
     assertNoNewAgentLegacyPromptTemplate(
       hireInput.adapterType,
       rawHireAdapterConfig,
@@ -2597,7 +2618,8 @@ export function agentRoutes(
       status,
       spentMonthlyCents: 0,
       lastHeartbeatAt: null,
-    });
+    }, ...(normalizedHireInput.adapterType === "openclaw_gateway"
+      ? [{ actor: { userId: req.actor.userId, agentId: req.actor.agentId } }] as const : []));
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
@@ -2611,7 +2633,7 @@ export function agentRoutes(
         ) ?? {};
       const requestedRuntimeConfig =
         redactEventPayload(
-          (normalizedHireInput.runtimeConfig ?? agent.runtimeConfig) as Record<string, unknown>,
+          (requestedAdapterType === "openclaw_gateway" ? agent.runtimeConfig : normalizedHireInput.runtimeConfig ?? agent.runtimeConfig) as Record<string, unknown>,
         ) ?? {};
       const requestedMetadata =
         redactEventPayload(
@@ -2735,6 +2757,7 @@ export function agentRoutes(
     } = req.body;
     createInput.adapterType = assertKnownAdapterType(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
+    await assertCanCreateGatewayCredentials(req, companyId, createInput.adapterType, rawCreateAdapterConfig, createInput.runtimeConfig);
     assertNoNewAgentLegacyPromptTemplate(
       createInput.adapterType,
       rawCreateAdapterConfig,
@@ -2784,7 +2807,8 @@ export function agentRoutes(
       status: "idle",
       spentMonthlyCents: 0,
       lastHeartbeatAt: null,
-    });
+    }, ...(createInput.adapterType === "openclaw_gateway"
+      ? [{ actor: { userId: req.actor.userId, agentId: req.actor.agentId } }] as const : []));
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
     const actor = getActorInfo(req);
@@ -2921,7 +2945,7 @@ export function agentRoutes(
     }
 
     const syncedAdapterConfig = syncInstructionsBundleConfigFromFilePath(existing, nextAdapterConfig);
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+    const normalizedAdapterConfig = existing.adapterType === "openclaw_gateway" ? syncedAdapterConfig : await secretsSvc.normalizeAdapterConfigForPersistence(
       existing.companyId,
       syncedAdapterConfig,
       { strictMode: strictSecretsMode, adapterType: existing.adapterType },
@@ -2987,7 +3011,7 @@ export function agentRoutes(
 
     const actor = getActorInfo(req);
     const { bundle, adapterConfig } = await instructions.updateBundle(existing, req.body);
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+    const normalizedAdapterConfig = existing.adapterType === "openclaw_gateway" ? adapterConfig : await secretsSvc.normalizeAdapterConfigForPersistence(
       existing.companyId,
       adapterConfig,
       { strictMode: strictSecretsMode, adapterType: existing.adapterType },
@@ -3050,7 +3074,7 @@ export function agentRoutes(
     const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
       clearLegacyPromptTemplate: req.body.clearLegacyPromptTemplate,
     });
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+    const normalizedAdapterConfig = existing.adapterType === "openclaw_gateway" ? result.adapterConfig : await secretsSvc.normalizeAdapterConfigForPersistence(
       existing.companyId,
       result.adapterConfig,
       { strictMode: strictSecretsMode, adapterType: existing.adapterType },
@@ -3119,6 +3143,53 @@ export function agentRoutes(
     res.json(result.bundle);
   });
 
+  router.post(
+    "/agents/:id/gateway-auth-token-binding",
+    validate(gatewayAuthTokenBindingSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const id = req.params.id as string;
+      const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+      if (!existing) return;
+      await assertCanUpdateAgent(req, existing);
+
+      const actor = getActorInfo(req);
+      const agent = await svc.updateGatewayAuthTokenBindingCas(
+        id,
+        {
+          ...req.body,
+          actor: {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        },
+      );
+      if (!agent) {
+        res.status(404).json({ error: "Agent not found" });
+        return;
+      }
+
+      const adapterConfig = asRecord(agent.adapterConfig) ?? {};
+      const headers = asRecord(adapterConfig.headers) ?? {};
+      const preservedHeaderKeys = Object.keys(headers).sort();
+
+
+      res.json({
+        agentId: agent.id,
+        updatedAt: agent.updatedAt.toISOString(),
+        binding: {
+          configPath: "authToken",
+          redacted: true,
+          legacyHeaderRemoved: true,
+        },
+        preserved: {
+          headerKeys: preservedHeaderKeys,
+          devicePrivateKeyPresent: adapterConfig.devicePrivateKeyPem != null,
+        },
+      });
+    },
+  );
+
   router.patch("/agents/:id", validate(updateAgentSchema), async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
@@ -3160,6 +3231,16 @@ export function agentRoutes(
       assertValidHeartbeatMaxLiveRuns(runtimeConfig);
       requestedRuntimeConfig = runtimeConfig;
     }
+    const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
+    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
+      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
+    );
+    if (profileOnlyChange) {
+      await assertCanApplyAgentProfileChange(req, existing);
+    } else {
+      await assertCanUpdateAgent(req, existing);
+    }
+
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
@@ -3234,15 +3315,6 @@ export function agentRoutes(
           allowedSandboxProviders: allowedSandboxProvidersForAgent(requestedAdapterType),
         },
       );
-    }
-    const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
-    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
-      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
-    );
-    if (profileOnlyChange) {
-      await assertCanApplyAgentProfileChange(req, existing);
-    } else {
-      await assertCanUpdateAgent(req, existing);
     }
 
     const actor = getActorInfo(req);
@@ -3374,6 +3446,7 @@ export function agentRoutes(
       res.status(409).json({ error: "Only pending approval agents can be approved" });
       return;
     }
+    if (existing.adapterType === "openclaw_gateway") await assertCanUpdateAgent(req, existing);
 
     // Resolve the linked hire approval (clears it from the inbox) and run the
     // shared approval side effects: agent activation, budget policy, and the
@@ -3387,7 +3460,9 @@ export function agentRoutes(
       await approvalsSvc.approve(openApproval.id, decidedByUserId);
       agent = await svc.getById(id);
     } else {
-      const approval = await svc.activatePendingApproval(id);
+      const approval = existing.adapterType === "openclaw_gateway"
+        ? await svc.activatePendingApproval(id, undefined, { userId: decidedByUserId })
+        : await svc.activatePendingApproval(id);
       if (!approval) {
         res.status(404).json({ error: "Agent not found" });
         return;
