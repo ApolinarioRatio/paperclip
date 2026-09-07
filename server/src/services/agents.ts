@@ -98,6 +98,33 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const LEGACY_OPENCLAW_CREDENTIAL_HEADER_KEYS = new Set([
+  "x-openclaw-token",
+  "x-openclaw-auth",
+  "authorization",
+]);
+
+function normalizeOpenClawCredentialConfig(adapterType: string, adapterConfig: Record<string, unknown>) {
+  if (adapterType !== "openclaw_gateway") return adapterConfig;
+  const headers = isPlainRecord(adapterConfig.headers) ? adapterConfig.headers : null;
+  if (!headers) return adapterConfig;
+  let legacyValue: unknown;
+  const normalizedHeaders: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (LEGACY_OPENCLAW_CREDENTIAL_HEADER_KEYS.has(key.trim().toLowerCase())) {
+      legacyValue ??= value;
+    } else {
+      normalizedHeaders[key] = value;
+    }
+  }
+  if (Object.keys(normalizedHeaders).length === Object.keys(headers).length) return adapterConfig;
+  return {
+    ...adapterConfig,
+    headers: normalizedHeaders,
+    ...(Object.prototype.hasOwnProperty.call(adapterConfig, "authToken") ? {} : { authToken: legacyValue }),
+  };
+}
+
 function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -525,6 +552,10 @@ export function agentService(db: Db) {
       Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") &&
       isPlainRecord(normalizedPatch.adapterConfig)
     ) {
+      normalizedPatch.adapterConfig = normalizeOpenClawCredentialConfig(
+        (normalizedPatch.adapterType ?? existing.adapterType) as string,
+        normalizedPatch.adapterConfig,
+      );
       normalizedPatch.adapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
         existing.companyId,
         normalizedPatch.adapterConfig,
@@ -624,7 +655,11 @@ export function agentService(db: Db) {
       const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
       const adapterType = data.adapterType ?? "process";
       const adapterConfig = isPlainRecord(data.adapterConfig)
-        ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
+        ? await secretsSvc.normalizeAdapterConfigForPersistence(
+            companyId,
+            normalizeOpenClawCredentialConfig(adapterType, data.adapterConfig),
+            { adapterType },
+          )
         : {};
       return db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
@@ -820,6 +855,10 @@ export function agentService(db: Db) {
           Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&
           isPlainRecord(patch.adapterConfig)
         ) {
+          patch.adapterConfig = normalizeOpenClawCredentialConfig(
+            (patch.adapterType ?? existing.adapterType) as string,
+            patch.adapterConfig,
+          );
           patch.adapterConfig = await secretService(txDb).normalizeAdapterConfigForPersistence(
             existing.companyId,
             patch.adapterConfig,

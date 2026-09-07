@@ -28,6 +28,16 @@ function baseValues(): CreateConfigValues {
 }
 
 describe("buildOpenClawGatewayConfig", () => {
+  it("normalizes legacy header keys and gives canonical authToken precedence", () => {
+    const config = buildOpenClawGatewayConfig({
+      ...baseValues(),
+      authToken: "fixture-canonical-token",
+      headersJson: JSON.stringify({ " X-OpenClaw-Token ": "fixture-legacy-token" }),
+    });
+
+    expect(config.headers).toEqual({ "x-openclaw-token": "fixture-canonical-token" });
+  });
+
   it("applies the documented timeout defaults when unset (timeoutSec=120, waitTimeoutMs=120000)", () => {
     const config = buildOpenClawGatewayConfig(baseValues());
     expect(config.timeoutSec).toBe(120);

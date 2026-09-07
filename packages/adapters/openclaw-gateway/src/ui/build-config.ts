@@ -12,6 +12,12 @@ function parseJsonObject(text: string): Record<string, unknown> | null {
   }
 }
 
+function normalizeHeaderKeys(headers: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(headers).map(([key, value]) => [key.trim().toLowerCase(), value]),
+  );
+}
+
 export function buildOpenClawGatewayConfig(v: CreateConfigValues): Record<string, unknown> {
   const ac: Record<string, unknown> = {};
 
@@ -46,7 +52,7 @@ export function buildOpenClawGatewayConfig(v: CreateConfigValues): Record<string
 
   // Headers — parse headersJson first, then inject authToken on top
   const headers = parseJsonObject(v.headersJson ?? "");
-  if (headers) ac.headers = headers;
+  if (headers) ac.headers = normalizeHeaderKeys(headers);
   if (v.authToken) {
     const h = (ac.headers as Record<string, unknown>) ?? {};
     h["x-openclaw-token"] = v.authToken;
