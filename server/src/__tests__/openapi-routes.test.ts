@@ -147,6 +147,30 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents the board-only gateway binding CAS request and metadata-only receipt", () => {
+    const operation = buildOpenApiSpec().paths["/api/agents/{id}/gateway-auth-token-binding"].post;
+    expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(operation.description).toContain("agent_config:update");
+    expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      type: "object",
+      required: ["expectedUpdatedAt", "value"],
+      properties: {
+        expectedUpdatedAt: { type: "string", format: "date-time" },
+        value: { type: "string", minLength: 1 },
+      },
+    });
+    expect(Object.keys(operation.responses).sort()).toEqual(["200", "400", "401", "403", "404", "409", "422"]);
+    const receipt = operation.responses["200"].content["application/json"].schema;
+    expect(Object.keys(receipt.properties).sort()).toEqual(["agentId", "binding", "preserved", "updatedAt"]);
+    expect(Object.keys(receipt.properties.binding.properties).sort()).toEqual([
+      "configPath", "legacyHeaderRemoved", "redacted",
+    ]);
+    expect(Object.keys(receipt.properties.preserved.properties).sort()).toEqual([
+      "devicePrivateKeyPresent", "headerKeys",
+    ]);
+    expect(JSON.stringify(receipt)).not.toMatch(/"(?:value|secretId|secretRef|token)"/);
+  });
+
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
 

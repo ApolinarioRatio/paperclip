@@ -5636,6 +5636,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   });
 
   afterEach(async () => {
+    await resetRuntimeServicesForTests();
     await db.delete(workspaceRuntimeServices);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);

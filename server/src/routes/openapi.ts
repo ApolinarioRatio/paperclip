@@ -5,6 +5,7 @@ import {
   createAgentSchema,
   createAgentHireSchema,
   updateAgentSchema,
+  gatewayAuthTokenBindingSchema,
   updateAgentPermissionsSchema,
   updateAgentInstructionsPathSchema,
   updateAgentInstructionsBundleSchema,
@@ -761,6 +762,7 @@ const BOARD_ONLY_PREFIXES = [
 ];
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/agents/{id}/gateway-auth-token-binding",
   "GET /api/cloud/stacks",
   "GET /api/companies",
   "POST /api/companies",
@@ -1913,6 +1915,39 @@ registry.registerPath({
   summary: "Get agent configuration",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/gateway-auth-token-binding",
+  tags: ["agents"],
+  summary: "Replace an OpenClaw gateway credential binding with compare-and-swap",
+  description: "Requires a board actor with agent_config:update permission. Atomically replaces the managed binding and scrubs legacy credential snapshots. Returns structural metadata only; a stale expectedUpdatedAt returns 409 without writes.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(gatewayAuthTokenBindingSchema),
+  },
+  responses: {
+    200: r.ok(z.object({
+      agentId: z.string(),
+      updatedAt: z.string().datetime(),
+      binding: z.object({
+        configPath: z.literal("authToken"),
+        redacted: z.literal(true),
+        legacyHeaderRemoved: z.literal(true),
+      }).strict(),
+      preserved: z.object({
+        headerKeys: z.array(z.string()),
+        devicePrivateKeyPresent: z.boolean(),
+      }).strict(),
+    }).strict()),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({

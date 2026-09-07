@@ -179,6 +179,7 @@ type StoppedRuntimeServiceReuseCandidate = {
 };
 
 const runtimeServicesById = new Map<string, RuntimeServiceRecord>();
+const pendingRuntimeServiceExitCleanups = new Set<Promise<void>>();
 const runtimeServicesByReuseKey = new Map<string, string>();
 const runtimeServiceLeasesByRun = new Map<string, string[]>();
 const runtimeProvisionByWorkspace = new Map<string, Promise<void>>();
@@ -195,9 +196,22 @@ type ProcessOutputAccumulator = {
   finish(): ProcessOutputCapture;
 };
 
-export async function resetRuntimeServicesForTests() {
+export async function resetRuntimeServicesForTests(
+  opts: { terminateProcesses?: boolean; simulateSupervisorExit?: boolean } = {},
+) {
+  if (opts.terminateProcesses) {
+    for (const serviceId of [...runtimeServicesById.keys()]) {
+      await stopRuntimeService(serviceId).catch(() => undefined);
+    }
+  }
+  while (pendingRuntimeServiceExitCleanups.size > 0) {
+    await Promise.all([...pendingRuntimeServiceExitCleanups]);
+  }
   for (const record of runtimeServicesById.values()) {
     clearIdleTimer(record);
+    if (opts.simulateSupervisorExit) {
+      record.child = null;
+    }
   }
   runtimeServicesById.clear();
   runtimeServicesByReuseKey.clear();
@@ -4707,8 +4721,11 @@ function registerRuntimeService(db: Db | undefined, record: RuntimeServiceRecord
     if (current.reuseKey && runtimeServicesByReuseKey.get(current.reuseKey) === current.id) {
       runtimeServicesByReuseKey.delete(current.reuseKey);
     }
-    void removeLocalServiceRegistryRecord(current.serviceKey);
-    void persistRuntimeServiceRecord(db, current);
+    const cleanup = (async () => {
+      await removeLocalServiceRegistryRecord(current.serviceKey);
+      await persistRuntimeServiceRecord(db, current);
+    })().finally(() => pendingRuntimeServiceExitCleanups.delete(cleanup));
+    pendingRuntimeServiceExitCleanups.add(cleanup);
   });
 }
 
